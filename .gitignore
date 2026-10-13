@@ -24,3 +24,5 @@ gui_api_credentials.txt
 runs/
 *.parquet
 private_presets/
+workspace/
+.serena/

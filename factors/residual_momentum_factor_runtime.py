@@ -123,6 +123,11 @@ class ResidualMomentumParams:
     verbose: bool = True
 
 
+# JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
+# appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
+_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])[0-9]?(?:[._-]?[A-Z]+)?")
+
+
 def normalize_jp_code(value: object) -> Optional[str]:
     if pd.isna(value):
         return None
@@ -131,6 +136,9 @@ def normalize_jp_code(value: object) -> Optional[str]:
         return None
     if text.endswith(".0"):
         text = text[:-2]
+    match = _JP_CODE_RE.fullmatch(text.upper())
+    if match:
+        return match.group(1)
     digits = re.sub(r"\D", "", text)
     if len(digits) >= 4:
         return digits[:4]
