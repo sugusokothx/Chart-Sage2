@@ -39,6 +39,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
 PriceLoader = Callable[[pd.DataFrame, pd.Timestamp, pd.Timestamp, Optional[str], dict[str, Any]], pd.DataFrame]
 
 
+# JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
+# appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
+_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])[0-9]?(?:[._-]?[A-Z]+)?")
+
+
 def normalize_jp_code(value: object) -> Optional[str]:
     if pd.isna(value):
         return None
@@ -47,6 +52,9 @@ def normalize_jp_code(value: object) -> Optional[str]:
         return None
     if text.endswith(".0"):
         text = text[:-2]
+    match = _JP_CODE_RE.fullmatch(text.upper())
+    if match:
+        return match.group(1)
     match = re.search(r"(\d{4})", text)
     return match.group(1) if match else None
 

@@ -226,8 +226,17 @@ def _first_existing(cols: Iterable[Any], candidates: Iterable[str]) -> Any | Non
     return None
 
 
+# JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
+# appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
+_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])[0-9]?(?:[._-]?[A-Z]+)?")
+
+
 def _normalize_code(x: Any) -> str | None:
-    match = re.search(r"(\d{4})", str(x).strip())
+    text = str(x).strip()
+    match = _JP_CODE_RE.fullmatch(text.upper())
+    if match:
+        return match.group(1)
+    match = re.search(r"(\d{4})", text)
     return match.group(1) if match else None
 
 

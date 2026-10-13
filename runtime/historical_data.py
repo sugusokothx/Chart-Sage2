@@ -7,7 +7,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 import pandas as pd
 
-from topix_pool_runtime import HistoricalDataProvider, RunReport, _normalize_code
+from topix_pool_runtime import _JP_CODE_RE, HistoricalDataProvider, RunReport, _normalize_code
 
 
 SCHEMAS: dict[str, set[str]] = {
@@ -46,11 +46,9 @@ def normalize_code(value: object) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
-        text = value.strip()
-        if len(text) == 4 and text.isdigit():
-            return text
-        if len(text) >= 4 and text[:4].isdigit() and all(ch in {".", "-", "_"} or ch.isalpha() for ch in text[4:]):
-            return text[:4]
+        match = _JP_CODE_RE.fullmatch(value.strip().upper())
+        if match:
+            return match.group(1)
     elif isinstance(value, (int, np.integer)):
         if 1000 <= int(value) <= 9999:
             return f"{int(value):04d}"

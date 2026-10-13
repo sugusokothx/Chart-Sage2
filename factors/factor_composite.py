@@ -188,22 +188,17 @@ Practical note:
     _safe_display(Markdown(text) if Markdown else text)
 
 
+# JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
+# appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
+_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])[0-9]?(?:[._-]?[A-Z]+)?")
+
+
 def normalize_code(value: object) -> Optional[str]:
     if pd.isna(value):
         return None
     text = str(value).strip()
-    if not text:
-        return None
-    upper = text.upper()
-    if re.fullmatch(r"\d{4}", text):
-        return text
-    if re.fullmatch(r"\d{4}\.T", upper):
-        return text[:4]
-    if re.fullmatch(r"\d{5}", text):
-        return text[:4]
-    if re.search(r"\d{5,}", text):
-        return None
-    return None
+    match = _JP_CODE_RE.fullmatch(text.upper())
+    return match.group(1) if match else None
 
 
 def first_existing(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
