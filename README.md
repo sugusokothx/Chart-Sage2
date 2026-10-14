@@ -249,6 +249,8 @@ Typical outputs include:
   - central local data provider
   - loads prices, fundamentals, market cap, margin, and index data from local cache tables
   - exposes loader methods used by factor runtimes
+- `runtime/provider_readiness.py`
+  - measures how far an alternative data provider satisfies what the engine expects
 - `runtime/jquants_cache_builder.py`
   - incremental cache build and refresh utilities for J-Quants-sourced data
 - `runtime/factor_cache.py`
@@ -515,6 +517,28 @@ Current provider method:
 - `JpxHistoricalProvider.load_close_prices(...)`
 
 Expected output is a wide date-indexed table of close prices.
+
+## Checking an alternative provider
+
+The engine duck-types its provider, so another data source can replace
+`JpxHistoricalProvider` if it exposes the same methods and table shapes.
+`runtime/provider_readiness.py` lists those expectations and reports every gap
+at once:
+
+```python
+from provider_readiness import check_provider_readiness
+
+report = check_provider_readiness(provider)  # interface only, reads no data
+report = check_provider_readiness(provider, "2024-12-30", factors=("dual_ma", "reversal"))
+print(report.summary())  # ready=..., then blocking checks and warnings
+report.to_frame()        # one row per check
+```
+
+- `required` checks block a backtest; `recommended` ones degrade it (for
+  example, missing adjustment columns make the engine fall back to raw prices).
+- Factor loaders are required only for the factors passed in `factors`.
+- A provider whose market caps are a proxy should set `market_cap_basis` to
+  describe it; the check then warns that absolute JPY thresholds do not apply.
 
 ## How to add a new factor
 
