@@ -43,7 +43,9 @@ AttentionInputLoader = Callable[[pd.DataFrame, pd.Timestamp, pd.Timestamp, Optio
 
 # JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
 # appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
-_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])[0-9]?(?:[._-]?[A-Z]+)?")
+# A 5th digit other than 0 marks a preferred share, warrant or new share
+# (e.g. 25935); those are not the common stock and must not collapse onto it.
+_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])([0-9]?)(?:[._-]?[A-Z]+)?")
 
 
 def normalize_jp_code(value: object) -> Optional[str]:
@@ -57,7 +59,7 @@ def normalize_jp_code(value: object) -> Optional[str]:
         text = text[:-2]
     match = _JP_CODE_RE.fullmatch(text.upper())
     if match:
-        return match.group(1)
+        return match.group(1) if match.group(2) in ("", "0") else None
     digits = re.sub(r"\D", "", text)
     if len(digits) >= 4:
         return digits[:4]

@@ -48,7 +48,7 @@ def normalize_code(value: object) -> str | None:
     if isinstance(value, str):
         match = _JP_CODE_RE.fullmatch(value.strip().upper())
         if match:
-            return match.group(1)
+            return match.group(1) if match.group(2) in ("", "0") else None
     elif isinstance(value, (int, np.integer)):
         if 1000 <= int(value) <= 9999:
             return f"{int(value):04d}"
@@ -56,6 +56,8 @@ def normalize_code(value: object) -> str | None:
         int_value = int(value)
         if 1000 <= int_value <= 9999:
             return f"{int_value:04d}"
+        # str(25935.0) would hide the 5th digit from the code pattern.
+        return _normalize_code(int_value)
     return _normalize_code(value)
 
 

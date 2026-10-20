@@ -190,7 +190,9 @@ Practical note:
 
 # JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
 # appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
-_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])[0-9]?(?:[._-]?[A-Z]+)?")
+# A 5th digit other than 0 marks a preferred share, warrant or new share
+# (e.g. 25935); those are not the common stock and must not collapse onto it.
+_JP_CODE_RE = re.compile(r"([0-9][0-9A-Z][0-9][0-9A-Z])([0-9]?)(?:[._-]?[A-Z]+)?")
 
 
 def normalize_code(value: object) -> Optional[str]:
@@ -198,7 +200,9 @@ def normalize_code(value: object) -> Optional[str]:
         return None
     text = str(value).strip()
     match = _JP_CODE_RE.fullmatch(text.upper())
-    return match.group(1) if match else None
+    if not match or match.group(2) not in ("", "0"):
+        return None
+    return match.group(1)
 
 
 def first_existing(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
