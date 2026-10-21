@@ -20,6 +20,11 @@ SCHEMAS: dict[str, set[str]] = {
     "margin": {"date", "code", "margin_buy_balance", "margin_sell_balance"},
 }
 
+# JPX publishes weekly margin balances on the 2nd business day after the
+# application date (Fri -> Tue).  J-Quants PubDate only exists from the
+# 2026-09-25 application onwards, so older rows fall back to this rule.
+MARGIN_PUBLICATION_LAG_TRADING_DAYS = 2
+
 ADJUSTMENT_RATIO_JUMP_UPPER = 3.0
 ADJUSTMENT_RATIO_JUMP_LOWER = 1.0 / ADJUSTMENT_RATIO_JUMP_UPPER
 
@@ -61,7 +66,7 @@ def normalize_code(value: object) -> str | None:
     return _normalize_code(value)
 
 
-def _lower_rename(frame: pd.DataFrame) -> pd.DataFrame:
+def _lower_rename(frame: pd.DataFrame, schema_name: str | None = None) -> pd.DataFrame:
     out = frame.copy()
     out.columns = [str(col).strip() for col in out.columns]
     lower_map = {col: col.strip().lower() for col in out.columns}
@@ -86,6 +91,10 @@ def _lower_rename(frame: pd.DataFrame) -> pd.DataFrame:
         "listedshares": "shares_outstanding",
         "index_name": "index_code",
     }
+    if schema_name == "margin":
+        # Margin rows carry both an application date and a publication date;
+        # folding the latter into disclosed_date would hide it from the loader.
+        del aliases["published_date"]
     return out.rename(columns={col: aliases.get(col, col) for col in out.columns})
 
 
@@ -168,7 +177,7 @@ def validate_nonempty_table(frame: pd.DataFrame, schema_name: str, path: str | P
 
 def _coerce_date_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    for col in ["date", "asof_date", "disclosed_date"]:
+    for col in ["date", "asof_date", "disclosed_date", "published_date"]:
         if col in out.columns:
             out[col] = pd.to_datetime(out[col], errors="coerce").dt.tz_localize(None)
     if "code" in out.columns:
@@ -240,7 +249,7 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             return frame.copy(deep=False) if copy else frame
         try:
             path = self._resolve_path(name)
-            frame = _coerce_date_columns(_lower_rename(read_local_table(path)))
+            frame = _coerce_date_columns(_lower_rename(read_local_table(path), name))
             frame = _deduplicate_table(frame, name)
             validate_schema(frame, name, path)
             if name in {"universe", "sector", "market_cap", "prices"}:
@@ -390,7 +399,11 @@ class JpxHistoricalProvider(HistoricalDataProvider):
     ) -> pd.DataFrame:
         codes = universe_codes["code"].dropna().astype(str).tolist()
         margin = self.table("margin", copy=False)
-        margin = margin.loc[margin["code"].isin(codes) & margin["date"].between(start_date, end_date, inclusive="both")].copy()
+        margin = margin.loc[margin["code"].isin(codes) & (margin["date"] >= start_date)].copy()
+        # Cut on publication, not application: a Friday balance is not public
+        # until the following Tuesday.
+        margin["available_date"] = self._margin_available_dates(margin)
+        margin = margin.loc[margin["available_date"] <= pd.Timestamp(end_date).normalize()].copy()
         report = RunReport(mode="provider_internal", anchor_date=str(pd.Timestamp(end_date).date()))
         caps = self.get_market_caps(codes, end_date, report)[["code", "market_cap_jpy"]]
         prices = self.price_frame(codes, pd.Timestamp(end_date) - pd.Timedelta(days=120), end_date)
@@ -399,6 +412,30 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             adv = prices.groupby("code")["trading_value"].mean().rename("avg_daily_trading_value").reset_index()
             margin = margin.merge(adv, on="code", how="left")
         return margin.merge(caps, on="code", how="left")
+
+    def _margin_available_dates(self, margin: pd.DataFrame) -> pd.Series:
+        """Return when each margin row became public.
+
+        PubDate is used where present; otherwise the date is the application
+        date plus MARGIN_PUBLICATION_LAG_TRADING_DAYS on the prices calendar.
+        """
+
+        if margin.empty:
+            return pd.Series(pd.NaT, index=margin.index, dtype="datetime64[ns]")
+        app = pd.to_datetime(margin["date"]).dt.normalize()
+        calendar = np.sort(pd.to_datetime(self.table("prices", copy=False)["date"].dropna().unique()).normalize().to_numpy())
+        lag = MARGIN_PUBLICATION_LAG_TRADING_DAYS
+        positions = np.searchsorted(calendar, app.to_numpy(), side="right") + (lag - 1)
+        in_calendar = positions < len(calendar)
+        by_rule = pd.Series(pd.NaT, index=margin.index, dtype="datetime64[ns]")
+        by_rule[in_calendar] = calendar[positions[in_calendar]]
+        # Past the end of the prices calendar no signal date can use the row,
+        # but keep a weekday estimate rather than an unknown date.
+        by_rule[~in_calendar] = app[~in_calendar] + pd.offsets.BDay(lag)
+        if "published_date" in margin.columns:
+            published = pd.to_datetime(margin["published_date"], errors="coerce").dt.normalize()
+            return published.fillna(by_rule)
+        return by_rule
 
     def load_fundamental_panel(self, universe: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
         asof = pd.Timestamp(config.get("asof_date") or config.get("rebalance_date")).normalize()
