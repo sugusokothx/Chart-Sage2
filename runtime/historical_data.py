@@ -381,7 +381,11 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             prices["shares_outstanding"] = np.nan
             return prices
         caps = caps.loc[caps["asof_date"] <= pd.Timestamp(end_date).normalize()].sort_values(["code", "asof_date"])
-        latest = caps.groupby("code", as_index=False).tail(1)[["code", "market_cap", *([ "shares_outstanding"] if "shares_outstanding" in caps.columns else [])]]
+        latest = caps.groupby("code", as_index=False).tail(1)[["code", "market_cap", *([ "shares_outstanding"] if "shares_outstanding" in caps.columns else [])]].copy()
+        # CSV caches are read as strings; parse before dividing by close.
+        for col in ["market_cap", "shares_outstanding"]:
+            if col in latest.columns:
+                latest[col] = pd.to_numeric(latest[col], errors="coerce")
         merged = prices.merge(latest, on="code", how="left")
         if "shares_outstanding" not in merged.columns:
             merged["shares_outstanding"] = np.nan
