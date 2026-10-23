@@ -26,6 +26,14 @@ JQUANTS_CACHE_BUILDER_VERSION = "2026-04-18-full-month-cache"
 EQUITIES_DAILY_BARS_ENDPOINT = "/equities/bars/daily"
 MARGIN_DATASET_ENDPOINTS = {"daily_margin_interest", "weekly_margin_interest"}
 MARGIN_ENDPOINT_PATHS = {"/markets/margin-alert", "/markets/margin-interest"}
+# /markets/margin-interest delivers a balance every business day from the
+# 2026-09-25 application onwards (weekly, usually Friday, before).  An empty
+# date shard written within this many days of its date may predate
+# publication, so it is refetched instead of trusted.
+MARGIN_EMPTY_SHARD_SETTLE_DAYS = 7
+# First application date delivered daily; margin_*_change compares daily rows
+# with the balance a week earlier so it keeps the weekly meaning.
+MARGIN_DAILY_DELIVERY_START = pd.Timestamp("2026-09-25")
 
 
 def _cell5_log(message: str) -> None:
@@ -296,8 +304,9 @@ class JQuantsApiConfig:
     save_format: str = "parquet"  # parquet preferred, csv fallback if parquet engine is missing
     include_margin: bool = True
     # Behaviour/crowding factor expects credit balance history, so the default
-    # margin cache uses weekly margin interest (/markets/margin-interest), not
-    # daily margin-alert issue flags.
+    # margin cache uses margin interest (/markets/margin-interest), not daily
+    # margin-alert issue flags.  The "weekly" name predates the endpoint's
+    # switch to daily delivery and is kept for existing configs.
     margin_dataset: str = "weekly_margin_interest"
     margin_optional: bool = True
     include_financials: bool = True
@@ -1709,7 +1718,14 @@ def _append_existing(data_dir: Path, name: str, frame: pd.DataFrame, keys: list[
     if existing_frames:
         frame = pd.concat([*existing_frames, frame], ignore_index=True)
     if not frame.empty:
-        frame = frame.drop_duplicates(subset=[k for k in keys if k in frame.columns], keep="last")
+        subset = [k for k in keys if k in frame.columns]
+        # Cached tables store dates as text while fresh rows hold Timestamps;
+        # compare date keys as dates so a refetched row replaces the cached one.
+        key_frame = frame[subset].copy()
+        for key in subset:
+            if key in {"date", "asof_date", "disclosed_date", "published_date"}:
+                key_frame[key] = pd.to_datetime(key_frame[key], errors="coerce").dt.normalize()
+        frame = frame.loc[~key_frame.duplicated(keep="last")]
     return _write_table(frame, data_dir, name, save_format)
 
 
@@ -1961,10 +1977,11 @@ def load_or_download_margin_shards(
     *,
     endpoint_name: str,
 ) -> pd.DataFrame:
-    """Ensure weekly margin-interest/date shards cover [start, end].
+    """Ensure margin-interest/date shards cover [start, end].
 
     J-Quants V2 margin endpoints require code or date.  For full-market cache
     building we request date shards; empty weekdays are cached as empty files.
+    Rows are weekly until the 2026-09-25 application and daily after it.
     """
 
     dates = [d for d in _date_shard_range(start, end) if d.weekday() < 5]
@@ -1974,9 +1991,12 @@ def load_or_download_margin_shards(
         key = day.strftime("%Y%m%d")
         path = _shard_path(data_path, "margin", key, save_format)
         alt = path.with_suffix(".csv")
-        if path.exists() or alt.exists():
-            frame = _read_shard(path if path.exists() else alt)
-        else:
+        cached = path if path.exists() else (alt if alt.exists() else None)
+        frame = _read_shard(cached) if cached is not None else None
+        if frame is not None and frame.empty and not _empty_margin_shard_is_settled(cached, day):
+            _cell5_log(f"margin shard date={key} empty cache may predate publication; refetching path={cached}")
+            frame = None
+        if frame is None:
             _cell5_log(f"download margin shard {idx}/{len(dates)} endpoint={endpoint_name} date={key}")
             raw = client.get_dataset(endpoint_name, {"date": key}, endpoint_name)
             frame = normalize_jquants_margin(raw)
@@ -1993,8 +2013,37 @@ def load_or_download_margin_shards(
     out = out.drop_duplicates(["date", "code"], keep="last").sort_values(["code", "date"])
     for balance_col, change_col in [("margin_buy_balance", "margin_buy_change"), ("margin_sell_balance", "margin_sell_change")]:
         if change_col not in out.columns or pd.to_numeric(out[change_col], errors="coerce").notna().sum() == 0:
-            out[change_col] = pd.to_numeric(out[balance_col], errors="coerce").groupby(out["code"]).diff()
+            out[change_col] = _week_over_week_margin_change(out, balance_col)
     return out.loc[out["date"].between(start, end, inclusive="both")].reset_index(drop=True)
+
+
+def _empty_margin_shard_is_settled(path: Path, day: pd.Timestamp) -> bool:
+    written_at = pd.Timestamp.fromtimestamp(path.stat().st_mtime).normalize()
+    return written_at >= pd.Timestamp(day).normalize() + pd.Timedelta(days=MARGIN_EMPTY_SHARD_SETTLE_DAYS)
+
+
+def _week_over_week_margin_change(frame: pd.DataFrame, balance_col: str) -> pd.Series:
+    """Balance minus the code's balance one week earlier.
+
+    Weekly rows compare with the previous row, as a plain diff did; their
+    application dates move off Friday around holidays, so a fixed day gap
+    would skip a week.  Daily rows compare with the latest row at least 7
+    days earlier, so the change does not turn day-over-day after the switch.
+    """
+
+    work = pd.DataFrame(
+        {
+            "code": frame["code"].to_numpy(),
+            "date": pd.to_datetime(frame["date"]).to_numpy(),
+            "balance": pd.to_numeric(frame[balance_col], errors="coerce").to_numpy(),
+            "_row": np.arange(len(frame)),
+        }
+    )
+    gap_days = np.where(work["date"] >= MARGIN_DAILY_DELIVERY_START, 7, 1)
+    left = work.assign(_lookup=work["date"] - pd.to_timedelta(gap_days, unit="D")).sort_values("_lookup")
+    right = work[["code", "date", "balance"]].rename(columns={"date": "_lookup", "balance": "_previous"}).sort_values("_lookup")
+    matched = pd.merge_asof(left, right, on="_lookup", by="code", direction="backward").set_index("_row").sort_index()
+    return pd.Series((matched["balance"] - matched["_previous"]).to_numpy(), index=frame.index)
 
 
 CACHE_REQUIRED_COLUMNS: dict[str, set[str]] = {
@@ -2439,6 +2488,9 @@ def normalize_jquants_margin(raw: pd.DataFrame) -> pd.DataFrame:
             "margin_sell_negotiable": pd.to_numeric(_series(raw, "ShrtNegVol", "short_neg_vol"), errors="coerce"),
             "margin_buy_standardized": pd.to_numeric(_series(raw, "LongStdVol", "long_std_vol"), errors="coerce"),
             "margin_sell_standardized": pd.to_numeric(_series(raw, "ShrtStdVol", "short_std_vol"), errors="coerce"),
+            # JPY amounts exist from the 2026-09-25 application onwards only.
+            "margin_buy_value": pd.to_numeric(_series(raw, "LongVal", "long_val", "margin_buy_value"), errors="coerce"),
+            "margin_sell_value": pd.to_numeric(_series(raw, "ShrtVal", "short_val", "margin_sell_value"), errors="coerce"),
             "short_long_ratio": pd.to_numeric(_series(raw, "SLRatio", "short_long_ratio"), errors="coerce"),
             "issue_type": _series(raw, "IssType", "issue_type", default=pd.NA),
         }
@@ -3206,7 +3258,9 @@ def download_jquants_backtest_cache(
                     "WARNING: skipping optional margin cache after J-Quants V2 date-shard request failure. "
                     f"dataset={cfg.margin_dataset!r}, error={exc!r}"
                 )
-            outputs["margin"] = _append_existing(data_path, "margin", margin, ["date", "code", "published_date"], cfg.save_format)
+            # (date, code) identifies a balance; a refetch that adds PubDate must
+            # replace the earlier row rather than sit beside it.
+            outputs["margin"] = _append_existing(data_path, "margin", margin, ["date", "code"], cfg.save_format)
         if codes and not margin.empty:
             margin = margin.loc[margin["code"].isin(set(codes))]
 
