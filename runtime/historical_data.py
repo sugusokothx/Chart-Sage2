@@ -109,6 +109,60 @@ def read_local_table(path: str | Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported local data file type: {path}")
 
 
+def rebase_derived_price_adjustments(frame: pd.DataFrame) -> pd.DataFrame:
+    """Put OHLCV derived from daily factors on one basis across cached months.
+
+    Bulk CSV has no adjusted OHLCV, so the builder derives it per shard. Older
+    caches have no source marker; recognize them only when both adjusted close
+    and volume match the month-local factors for every row of a code. Preserve
+    other supplied adjustments, including API prices on a different basis.
+    """
+
+    required = {"date", "code", "close", "volume", "adjustment_factor", "adjustment_close", "adjustment_volume"}
+    if frame.empty or not required.issubset(frame.columns):
+        return frame
+    work = frame.sort_values(["code", "date"], ascending=[True, False])
+    codes = work["code"]
+    factor = pd.to_numeric(work["adjustment_factor"], errors="coerce")
+    valid = factor.gt(0) & np.isfinite(factor)
+    cumulative = factor.where(valid, 1.0).groupby(codes).cumprod()
+    multiplier = cumulative.groupby(codes).shift(1, fill_value=1.0)
+    months = pd.to_datetime(work["date"]).dt.to_period("M")
+    month_basis = multiplier.groupby([codes, months]).transform("first")
+    local_multiplier = multiplier / month_basis
+
+    close = pd.to_numeric(work["close"], errors="coerce")
+    volume = pd.to_numeric(work["volume"], errors="coerce")
+    local_match = pd.Series(True, index=work.index)
+    for col, expected in [("adjustment_close", close * local_multiplier), ("adjustment_volume", volume / local_multiplier)]:
+        actual = pd.to_numeric(work[col], errors="coerce")
+        local_match &= np.isclose(actual, expected, rtol=1e-8, atol=1e-8, equal_nan=True)
+    derived = (
+        work["adjustment_source"].eq("daily_factors").fillna(False)
+        if "adjustment_source" in work.columns
+        else pd.Series(False, index=work.index)
+    )
+    complete = (valid & multiplier.gt(0) & np.isfinite(multiplier) & (derived | local_match)).groupby(codes).all()
+    repair = codes.isin(complete.index[complete])
+    if not repair.any():
+        return frame
+
+    out = frame.copy()
+    selected = work.index[repair]
+    for src in ["open", "high", "low", "close", "volume"]:
+        dst = f"adjustment_{src}"
+        if src not in work.columns or dst not in work.columns:
+            continue
+        raw = pd.to_numeric(work.loc[selected, src], errors="coerce")
+        scale = multiplier.loc[selected]
+        out[dst] = pd.to_numeric(out[dst], errors="coerce").astype(float)
+        out.loc[selected, dst] = raw / scale if src == "volume" else raw * scale
+    if "adjustment_source" not in out.columns:
+        out["adjustment_source"] = pd.Series(index=out.index, dtype=object)
+    out.loc[selected, "adjustment_source"] = "daily_factors"
+    return out
+
+
 def _flag_unreliable_adjusted_prices(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty or "code" not in frame.columns:
         return frame
@@ -293,6 +347,10 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             validate_schema(frame, name, path)
             if name in {"universe", "sector", "market_cap", "prices"}:
                 validate_nonempty_table(frame, name, path)
+            if name == "prices":
+                # Repair legacy main tables as well as newly assembled shards,
+                # before their month-boundary resets are flagged as bad data.
+                frame = rebase_derived_price_adjustments(frame)
         except FileNotFoundError:
             if required:
                 raise

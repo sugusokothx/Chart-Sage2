@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from historical_data import JpxHistoricalProvider, LocalDataPaths, normalize_code
+from historical_data import JpxHistoricalProvider, LocalDataPaths, normalize_code, rebase_derived_price_adjustments
 
 
 JQUANTS_CACHE_BUILDER_VERSION = "2026-04-18-full-month-cache"
@@ -1894,6 +1894,7 @@ def load_or_download_price_shards(
         return pd.DataFrame(columns=["date", "code", "open", "high", "low", "close", "volume"])
     data = pd.concat(frames, ignore_index=True)
     data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.tz_localize(None)
+    data = rebase_derived_price_adjustments(data)
     return data.loc[data["date"].between(start, end, inclusive="both")].reset_index(drop=True)
 
 
@@ -2272,6 +2273,7 @@ def normalize_jquants_prices(raw: pd.DataFrame) -> pd.DataFrame:
             work[dst] = pd.to_numeric(work[src], errors="coerce") * pd.to_numeric(work["_adj_multiplier"], errors="coerce")
         multiplier = pd.to_numeric(work["_adj_multiplier"], errors="coerce").replace(0, np.nan)
         work["adjustment_volume"] = pd.to_numeric(work["volume"], errors="coerce") / multiplier
+        work["adjustment_source"] = "daily_factors"
         out = work.drop(columns=["_cum_factor", "_adj_multiplier"]).sort_values(["code", "date"], kind="mergesort")
         _cell5_log("daily_quotes adjusted OHLCV derived from AdjFactor")
     log_cache_value_diagnostics("daily_quotes normalized", "prices", out)

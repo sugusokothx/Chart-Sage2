@@ -8,7 +8,12 @@ import pytest
 
 from attention_factor_runtime import run_attention_factor
 from historical_data import JpxHistoricalProvider, LocalDataPaths
-from jquants_cache_builder import _fins_summary_usecol, normalize_jquants_statements
+from jquants_cache_builder import (
+    _fins_summary_usecol,
+    load_or_download_price_shards,
+    normalize_jquants_prices,
+    normalize_jquants_statements,
+)
 
 
 # 1001 splits 1:2 on SPLIT; 1002 is its twin without a split, trading the
@@ -125,3 +130,72 @@ def test_statements_keep_the_period_end() -> None:
     assert out["current_period_end"].tolist() == [pd.Timestamp("2023-06-30")]
     # The bulk CSV reader keeps only listed columns.
     assert _fins_summary_usecol("CurPerEn")
+
+
+class _BulkPricesClient:
+    def __init__(self, prices: pd.DataFrame) -> None:
+        self.raw = prices.drop(columns=[c for c in prices if c.startswith("adjustment_") and c != "adjustment_factor"])
+        self.requests: list[dict] = []
+
+    def get_dataset(self, endpoint_name: str, params: dict, result_key: str) -> pd.DataFrame:
+        self.requests.append(params)
+        dates = self.raw["date"]
+        return self.raw.loc[dates.between(pd.Timestamp(params["from"]), pd.Timestamp(params["to"]))].copy()
+
+
+@pytest.mark.parametrize("split_date,ratio", [("2023-09-01", 2), ("2023-09-15", 5)])
+@pytest.mark.parametrize("save_format", ["csv", "parquet"])
+def test_monthly_bulk_cache_uses_one_adjustment_basis(tmp_path: Path, split_date: str, ratio: int, save_format: str) -> None:
+    prices = _prices()
+    split_code = prices["code"].eq("1001")
+    pre = prices["date"].lt(split_date)
+    prices.loc[split_code, "volume"] = np.where(pre[split_code], 2000.0 / ratio, 2000.0)
+    for col in ["open", "high", "low", "close"]:
+        prices.loc[split_code, col] = np.where(pre[split_code], 500.0 * ratio, 500.0)
+    prices.loc[split_code, "adjustment_factor"] = np.where(prices.loc[split_code, "date"].eq(split_date), 1.0 / ratio, 1.0)
+    financials = _financials()
+    financials.loc[financials["code"].eq("1001") & financials["current_period_end"].eq("2023-06-30"), "shares_outstanding"] = 2_000_000 / ratio
+    client = _BulkPricesClient(prices)
+    # Assemble once before the split, then extend using those already-cached
+    # months. The older shards must be rebased when September is appended.
+    start = pd.Timestamp("2022-01-01")
+    load_or_download_price_shards(client, tmp_path, start, pd.Timestamp("2023-08-31"), save_format)
+    assembled = load_or_download_price_shards(client, tmp_path, start, pd.Timestamp("2024-03-31"), save_format)
+    split = assembled.loc[assembled["code"].eq("1001")]
+    np.testing.assert_allclose(pd.to_numeric(split["adjustment_volume"]), 2000.0)
+    np.testing.assert_allclose(pd.to_numeric(split["adjustment_close"]), 500.0)
+    _cache(tmp_path, financials=financials)
+    if save_format == "csv":
+        (tmp_path / "prices.parquet").unlink()
+        assembled.to_csv(tmp_path / "prices.csv", index=False)
+    else:
+        assembled.to_parquet(tmp_path / "prices.parquet", index=False)
+    for asof in ["2023-08-31", "2023-10-31", "2024-03-29"]:
+        _assert_twins_match(_attention(tmp_path, asof))
+    requested = len(client.requests)
+    reloaded = load_or_download_price_shards(client, tmp_path, start, pd.Timestamp("2024-03-31"), save_format)
+    assert len(client.requests) == requested
+    np.testing.assert_allclose(pd.to_numeric(reloaded["adjustment_volume"]), pd.to_numeric(assembled["adjustment_volume"]))
+
+
+def test_legacy_monthly_main_cache_is_repaired_on_read(tmp_path: Path) -> None:
+    raw = _BulkPricesClient(_prices()).raw
+    legacy = pd.concat([normalize_jquants_prices(month) for _, month in raw.groupby(raw["date"].dt.to_period("M"))], ignore_index=True)
+    # Existing caches have no provenance column and are reused without running
+    # the cache builder. They must still get the same cross-month correction.
+    legacy = legacy.drop(columns=["adjustment_source"], errors="ignore")
+    _cache(tmp_path, prices=legacy)
+    _assert_twins_match(_attention(tmp_path, "2023-10-31"))
+
+
+def test_supplied_adjustments_on_a_later_basis_are_preserved(tmp_path: Path) -> None:
+    # An API cache can already include a split beyond its last stored date.
+    prices = _prices()
+    for col in ["open", "high", "low", "close"]:
+        prices[f"adjustment_{col}"] /= 3.0
+    prices["adjustment_volume"] *= 3.0
+    provider = JpxHistoricalProvider(LocalDataPaths(data_dir=_cache(tmp_path, prices=prices)))
+    out = provider.load_attention_inputs(CODES, DATES.min(), DATES.max())
+    np.testing.assert_allclose(out["volume"], 6000.0)
+    np.testing.assert_allclose(out["close"], 500.0 / 3.0)
+    np.testing.assert_allclose(out["shares_outstanding"], 6_000_000)
