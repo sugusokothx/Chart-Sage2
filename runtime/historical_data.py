@@ -88,6 +88,7 @@ def _lower_rename(frame: pd.DataFrame, schema_name: str | None = None) -> pd.Dat
         "adjustmentclose": "adjustment_close",
         "adjusted_close": "adjustment_close",
         "sharesoutstanding": "shares_outstanding",
+        "sharesbasisdate": "shares_basis_date",
         "listedshares": "shares_outstanding",
         "index_name": "index_code",
     }
@@ -231,7 +232,7 @@ def validate_nonempty_table(frame: pd.DataFrame, schema_name: str, path: str | P
 
 def _coerce_date_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    for col in ["date", "asof_date", "disclosed_date", "published_date", "current_period_end"]:
+    for col in ["date", "asof_date", "disclosed_date", "published_date", "current_period_end", "shares_basis_date"]:
         if col in out.columns:
             out[col] = pd.to_datetime(out[col], errors="coerce").dt.tz_localize(None)
     if "code" in out.columns:
@@ -301,6 +302,46 @@ def _adjusted_volume_ratio_on(prices: pd.DataFrame, shares: pd.DataFrame) -> pd.
         ).set_index("code")["shares_to_adjusted"]
     ratio = matched["backward"].fillna(matched["forward"])
     return ratio.rename("shares_to_adjusted").reset_index()
+
+
+def _ambiguous_financial_share_codes(prices: pd.DataFrame, shares: pd.DataFrame) -> set[str]:
+    """Find inferred share bases crossed by an action before disclosure.
+
+    ShOutFY/AvgSh may already restate those actions. Their numeric values alone
+    cannot distinguish a restatement from changes in issued shares. Inspect
+    individual events, not just the net factor (a split and consolidation can
+    cancel), and never infer the presentation basis from a later disclosure.
+    """
+
+    candidates = shares.loc[
+        shares["shares_basis_status"].eq("period_end")
+        & shares["shares_basis_date"].lt(shares["disclosed_date"]),
+        ["code", "shares_basis_date", "disclosed_date"],
+    ]
+    if candidates.empty:
+        return set()
+    work = prices.loc[prices["code"].isin(candidates["code"])].sort_values(["code", "date"])
+    action = pd.Series(False, index=work.index)
+    factor_known = pd.Series(False, index=work.index)
+    if "adjustment_factor" in work.columns:
+        factor = pd.to_numeric(work["adjustment_factor"], errors="coerce")
+        factor_known = factor.gt(0) & np.isfinite(factor)
+        action |= factor_known & factor.ne(1)
+    if "adjustment_volume" in work.columns:
+        volume = pd.to_numeric(work["volume"], errors="coerce")
+        adjusted = pd.to_numeric(work["adjustment_volume"], errors="coerce")
+        ratio = (adjusted / volume).where(volume.gt(0) & adjusted.gt(0))
+        previous = ratio.groupby(work["code"]).ffill().groupby(work["code"]).shift(1)
+        # Prefer daily factors: rounded adjusted volumes need not have a
+        # perfectly constant ratio between actions. When factors are missing,
+        # allow one share of rounding at either end of the comparison.
+        rounding = (1.0 / volume).where(ratio.notna())
+        previous_rounding = rounding.groupby(work["code"]).ffill().groupby(work["code"]).shift(1)
+        complete_factors = factor_known.groupby(work["code"]).transform("all")
+        action |= ~complete_factors & (ratio - previous).abs().gt(rounding + previous_rounding + previous.abs() * 1e-6)
+    events = work.loc[action, ["code", "date"]].merge(candidates, on="code", how="inner")
+    crossed = events["date"].gt(events["shares_basis_date"]) & events["date"].le(events["disclosed_date"])
+    return set(events.loc[crossed, "code"])
 
 
 @dataclass
@@ -476,11 +517,11 @@ class JpxHistoricalProvider(HistoricalDataProvider):
 
         close/volume are split-adjusted for codes with adjusted prices across
         the window, so a split inside the 13-month window does not read as
-        abnormal volume.  Shares count on their own basis date (the period end
-        for fins/summary ShOutFY), so they are rescaled by that day's adjusted
-        / raw volume; otherwise a split after the period end inflates turnover
-        by the split ratio.  raw_close, raw_volume and shares_reported keep the
-        unadjusted values.
+        abnormal volume. Shares are rescaled from their reported basis date.
+        If a split crosses the period-end/disclosure interval, an explicit
+        shares_basis_date is required: ShOutFY/AvgSh may already reflect it.
+        Ambiguous counts stay missing instead of producing biased turnover.
+        raw_close, raw_volume and shares_reported keep the source values.
         """
 
         end = pd.Timestamp(end_date).normalize()
@@ -498,12 +539,14 @@ class JpxHistoricalProvider(HistoricalDataProvider):
                 shares = shares.merge(_adjusted_volume_ratio_on(basis_prices, shares), on="code", how="left")
         if "shares_to_adjusted" not in shares.columns:
             shares["shares_to_adjusted"] = np.nan
+        ambiguous = shares["shares_basis_status"].eq("ambiguous")
         # Without a ratio on the basis date the shares cannot be rescaled, so
         # those codes stay on raw prices.
         rescalable = set(shares.loc[shares["shares_to_adjusted"].notna(), "code"])
-        unrescaled = set(shares["code"]) - rescalable
+        unrescaled = set(shares.loc[~ambiguous, "code"]) - rescalable
         adjusted -= unrescaled
         shares.loc[~shares["code"].isin(adjusted), "shares_to_adjusted"] = 1.0
+        shares.loc[ambiguous, "shares_to_adjusted"] = np.nan
         shares["shares_outstanding"] = shares["shares_reported"] * shares["shares_to_adjusted"]
 
         if adjusted:
@@ -511,7 +554,7 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             prices.loc[use_adjusted, "close"] = prices.loc[use_adjusted, "adjustment_close"]
             prices.loc[use_adjusted, "volume"] = prices.loc[use_adjusted, "adjustment_volume"]
 
-        merged = prices.merge(shares[["code", "shares_reported", "shares_to_adjusted", "shares_outstanding"]], on="code", how="left")
+        merged = prices.merge(shares[["code", "shares_reported", "shares_basis_date", "shares_basis_status", "shares_to_adjusted", "shares_outstanding"]], on="code", how="left")
         caps = self.table("market_cap", required=False, copy=False)
         if caps.empty:
             merged["market_cap"] = np.nan
@@ -521,17 +564,20 @@ class JpxHistoricalProvider(HistoricalDataProvider):
         latest["market_cap"] = pd.to_numeric(latest["market_cap"], errors="coerce")
         merged = merged.merge(latest, on="code", how="left")
         # market_cap / close is on the same basis as close, adjusted or raw.
-        missing_shares = merged["shares_outstanding"].isna()
+        # Cap caches can be derived from the same ambiguous financial count;
+        # using them here would silently reintroduce the rejected assumption.
+        missing_shares = merged["shares_outstanding"].isna() & ~merged["shares_basis_status"].eq("ambiguous")
         merged.loc[missing_shares, "shares_outstanding"] = merged.loc[missing_shares, "market_cap"] / merged.loc[missing_shares, "close"].replace(0, np.nan)
         return merged
 
     def _attention_shares(self, codes: Iterable[str], asof: pd.Timestamp) -> pd.DataFrame:
         """Latest share count per code on or before asof, with the date it counts at.
 
-        fins/summary ShOutFY (AvgSh when absent) counts at the period end, or
-        the disclosed date when the cache predates current_period_end.  Codes
-        without it fall back to the market_cap table's shares, which count at
-        that snapshot's asof_date.
+        An explicit shares_basis_date identifies the presentation basis of
+        ShOutFY (AvgSh when absent). Otherwise use the period end only when no
+        action intervenes before disclosure. Legacy caches without period ends
+        retain the disclosed-date assumption. Codes without financial shares
+        fall back to the market_cap table's shares at its asof_date.
         """
 
         code_set = set(codes)
@@ -549,20 +595,31 @@ class JpxHistoricalProvider(HistoricalDataProvider):
                 if "current_period_end" in work.columns
                 else pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
             )
-            work["shares_basis_date"] = period_end.fillna(work["disclosed_date"])
+            explicit = (
+                pd.to_datetime(work["shares_basis_date"], errors="coerce")
+                if "shares_basis_date" in work.columns
+                else pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+            )
+            work["shares_basis_date"] = explicit.fillna(period_end).fillna(work["disclosed_date"])
+            work["shares_basis_status"] = np.where(explicit.notna(), "explicit", np.where(period_end.notna(), "period_end", "disclosed_date"))
+            work.loc[work["shares_basis_date"].gt(work["disclosed_date"]), "shares_basis_status"] = "ambiguous"
             work = work.loc[work["shares_reported"].gt(0)]
-            frames.append(_latest_per_code(work, "disclosed_date", asof)[["code", "shares_reported", "shares_basis_date"]])
+            work = _latest_per_code(work, "disclosed_date", asof)
+            ambiguous = _ambiguous_financial_share_codes(self.table("prices", copy=False), work)
+            work.loc[work["code"].isin(ambiguous), "shares_basis_status"] = "ambiguous"
+            frames.append(work[["code", "shares_reported", "shares_basis_date", "shares_basis_status"]])
         found = set(frames[0]["code"]) if frames else set()
         caps = self.table("market_cap", required=False, copy=False)
         if not caps.empty and "shares_outstanding" in caps.columns:
             work = caps.loc[caps["code"].isin(code_set - found)].copy()
             work["shares_reported"] = pd.to_numeric(work["shares_outstanding"], errors="coerce")
             work["shares_basis_date"] = work["asof_date"]
+            work["shares_basis_status"] = "market_cap"
             work = work.loc[work["shares_reported"].gt(0)]
-            frames.append(_latest_per_code(work, "asof_date", asof)[["code", "shares_reported", "shares_basis_date"]])
+            frames.append(_latest_per_code(work, "asof_date", asof)[["code", "shares_reported", "shares_basis_date", "shares_basis_status"]])
         frames = [frame for frame in frames if not frame.empty]
         if not frames:
-            return pd.DataFrame({"code": pd.Series(dtype=object), "shares_reported": pd.Series(dtype=float), "shares_basis_date": pd.Series(dtype="datetime64[ns]")})
+            return pd.DataFrame({"code": pd.Series(dtype=object), "shares_reported": pd.Series(dtype=float), "shares_basis_date": pd.Series(dtype="datetime64[ns]"), "shares_basis_status": pd.Series(dtype=object)})
         return pd.concat(frames, ignore_index=True)
 
     def load_behaviour_inputs(

@@ -1141,11 +1141,14 @@ FINS_SUMMARY_USECOL_CANDIDATES: tuple[str, ...] = (
     "shoutfy",
     "AvgSh",
     "avgsh",
-    # Period end the share counts above refer to.
+    # Accounting period end; the reported shares may already restate a split.
     "CurPerEn",
     "curperen",
     "CurrentPeriodEndDate",
     "current_period_end",
+    # Optional local/export metadata, not a native J-Quants response field.
+    "SharesBasisDate",
+    "shares_basis_date",
 )
 
 
@@ -2434,8 +2437,9 @@ def normalize_jquants_statements(raw: pd.DataFrame) -> pd.DataFrame:
             "disc_no": _series(raw, "DiscNo", "disc_no", default=pd.NA),
             "doc_type": _series(raw, "DocType", "doc_type", default=pd.NA),
             "period_type": _series(raw, "CurPerType", "period_type", "cur_per_type", default=pd.NA),
-            # ShOutFY counts shares at the period end, not the disclosed date.
+            # The period end alone does not identify the split basis of ShOutFY.
             "current_period_end": pd.to_datetime(_series(raw, "CurPerEn", "CurrentPeriodEndDate", "current_period_end", default=pd.NA), errors="coerce"),
+            "shares_basis_date": pd.to_datetime(_series(raw, "SharesBasisDate", "shares_basis_date", default=pd.NA), errors="coerce"),
             "code": _series(raw, "LocalCode", "Code", "IssueCode", "local_code", "code", "issue_code").map(normalize_code),
             "total_revenue": pd.to_numeric(_series(raw, "Sales", "NetSales", "net_sales", "Revenue", "revenue", "sales", "OperatingRevenue", "operating_revenue"), errors="coerce"),
             "operating_income": pd.to_numeric(_series(raw, "OP", "OperatingProfit", "operating_profit", "OperatingIncome", "operating_income", "BusinessProfit", "business_profit"), errors="coerce"),
