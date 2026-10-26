@@ -66,7 +66,7 @@ _CORE_METHODS: dict[str, tuple[str, str]] = {
 
 MARKET_CAP_COLUMNS = ("code", "market_cap_jpy", "market_cap_billion_jpy", "market_cap_rank")
 PRICE_FRAME_COLUMNS = ("date", "code", "open", "close", "volume")
-RECOMMENDED_PRICE_COLUMNS = ("adjustment_open", "adjustment_close", "adjustment_factor", "trading_value")
+RECOMMENDED_PRICE_COLUMNS = ("adjustment_close", "adjustment_factor", "trading_value")
 
 
 @dataclass
@@ -190,8 +190,8 @@ def _probe_prices_table(provider: Any, asof: pd.Timestamp) -> list[CheckResult]:
             "table:prices:recommended_columns",
             "recommended",
             "fail" if missing_recommended else "pass",
-            "corporate actions, adjusted execution prices, regime turnover",
-            f"missing {missing_recommended}; engine falls back to raw open/close and close*volume" if missing_recommended else "",
+            "corporate actions on holdings, adjusted factor prices, regime turnover",
+            f"missing {missing_recommended}; holdings miss splits without adjustment_factor, factors fall back to raw close and close*volume" if missing_recommended else "",
         )
     )
     return results

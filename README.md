@@ -535,7 +535,9 @@ report.to_frame()        # one row per check
 ```
 
 - `required` checks block a backtest; `recommended` ones degrade it (for
-  example, missing adjustment columns make the engine fall back to raw prices).
+  example, without `adjustment_factor` holdings are not restated for splits).
+- The engine trades and values holdings at raw open/close and restates share
+  counts on each `adjustment_factor` date. Adjusted prices feed factors only.
 - Factor loaders are required only for the factors passed in `factors`.
 - A provider whose market caps are a proxy should set `market_cap_basis` to
   describe it; the check then warns that absolute JPY thresholds do not apply.
