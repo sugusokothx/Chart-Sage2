@@ -291,7 +291,8 @@ def test_offsetting_actions_before_disclosure_still_leave_basis_unknown(tmp_path
     assert pd.isna(detail.loc["1001", "turnover"])
 
 
-def test_old_attention_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("factor", ["attention", "dual_ma", "residual_momentum"])
+def test_old_factor_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factor: str) -> None:
     provider = JpxHistoricalProvider(LocalDataPaths(data_dir=tmp_path))
     def lookup(name: str):
         return factor_cache.build_factor_cache_lookup(
@@ -302,12 +303,12 @@ def test_old_attention_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.M
     result = {"minimal": pd.DataFrame({"code": ["1001"], "factor_value": [1.0]}), "summary": {}}
     with monkeypatch.context() as old:
         old.setattr(factor_cache, "FACTOR_CACHE_VERSIONS", {})
-        for name in ["attention", "value"]:
+        for name in [factor, "value"]:
             factor_cache.save_factor_cache(lookup(name), result)
-    assert factor_cache.load_factor_cache(lookup("attention")) is None
+    assert factor_cache.load_factor_cache(lookup(factor)) is None
     assert factor_cache.load_factor_cache(lookup("value")) is not None
-    factor_cache.save_factor_cache(lookup("attention"), result)
-    assert factor_cache.load_factor_cache(lookup("attention")) is not None
+    factor_cache.save_factor_cache(lookup(factor), result)
+    assert factor_cache.load_factor_cache(lookup(factor)) is not None
 
 
 def test_statement_normalization_keeps_explicit_share_basis() -> None:

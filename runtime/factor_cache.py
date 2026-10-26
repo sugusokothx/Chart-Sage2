@@ -10,9 +10,15 @@ import pandas as pd
 
 
 CACHE_VERSION = "single_factor_cache_v2_overlap_reuse"
-# Old attention results assumed every financial share count was on the period
-# end's basis. Recompute them without invalidating unrelated factor caches.
-FACTOR_CACHE_VERSIONS = {"attention": "attention_v3_split_share_basis"}
+# Recompute affected factors without invalidating unrelated caches. Old
+# attention results assumed every financial share count was on the period
+# end's basis. dual_ma and residual_momentum prefer adjustment_close, which
+# monthly bulk caches used to derive per month instead of across the history.
+FACTOR_CACHE_VERSIONS = {
+    "attention": "attention_v3_split_share_basis",
+    "dual_ma": "dual_ma_v3_cross_month_adjustment",
+    "residual_momentum": "residual_momentum_v3_cross_month_adjustment",
+}
 
 
 @dataclass(frozen=True)
