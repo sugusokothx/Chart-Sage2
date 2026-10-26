@@ -433,13 +433,7 @@ def _has_valid_execution_prices(
         work = prices.loc[prices["date"].eq(pd.Timestamp(trade_date).normalize())].copy()
         if work.empty:
             return False
-        cols = ["adjustment_open", "open"] if price_col == "open" else ["adjustment_close", "close"]
-        for col in cols:
-            if col in work.columns:
-                values = pd.to_numeric(work[col], errors="coerce")
-                if values.gt(0).any():
-                    return True
-        return False
+        return bool(_raw_execution_price(work, price_col).gt(0).any())
     prices = _execution_prices(provider, code_list, trade_date, price_col)
     valid = pd.to_numeric(prices.reindex(code_list), errors="coerce")
     valid_count = int(valid.gt(0).sum())
@@ -1913,21 +1907,26 @@ def run_one_rebalance(
     )
 
 
+def _raw_execution_price(frame: pd.DataFrame, price_col: str) -> pd.Series:
+    """Unadjusted open/close for trading and valuing holdings.
+
+    Holdings and cost basis are restated by _apply_corporate_actions on each
+    action date, so they are on the raw basis.  Split-adjusted prices are
+    continuous through the split and would count it twice.
+    """
+
+    col = "open" if price_col == "open" else "close"
+    if col not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[col], errors="coerce")
+
+
 def _execution_prices(provider: JpxHistoricalProvider, codes: Iterable[str], trade_date: pd.Timestamp, price_col: str) -> pd.Series:
     frame = provider.price_frame(codes, trade_date, trade_date)
     if frame.empty:
         return pd.Series(dtype=float)
     frame = frame.sort_values(["date", "code"]).drop_duplicates(subset=["date", "code"], keep="last").copy()
-    if price_col == "open":
-        preferred_col = "adjustment_open"
-        fallback_col = "open"
-    else:
-        preferred_col = "adjustment_close"
-        fallback_col = "close"
-    out = frame.set_index("code")
-    preferred = pd.to_numeric(out[preferred_col], errors="coerce") if preferred_col in out.columns else pd.Series(index=out.index, dtype=float)
-    fallback = pd.to_numeric(out[fallback_col], errors="coerce") if fallback_col in out.columns else pd.Series(index=out.index, dtype=float)
-    return preferred.combine_first(fallback)
+    return _raw_execution_price(frame, price_col).set_axis(frame["code"])
 
 
 def _execution_price_history(
@@ -1944,15 +1943,7 @@ def _execution_price_history(
     if frame.empty:
         return pd.DataFrame()
     frame = frame.sort_values(["date", "code"]).drop_duplicates(subset=["date", "code"], keep="last").copy()
-    if price_col == "open":
-        preferred_col = "adjustment_open"
-        fallback_col = "open"
-    else:
-        preferred_col = "adjustment_close"
-        fallback_col = "close"
-    preferred = pd.to_numeric(frame[preferred_col], errors="coerce") if preferred_col in frame.columns else pd.Series(index=frame.index, dtype=float)
-    fallback = pd.to_numeric(frame[fallback_col], errors="coerce") if fallback_col in frame.columns else pd.Series(index=frame.index, dtype=float)
-    frame["execution_price"] = preferred.combine_first(fallback)
+    frame["execution_price"] = _raw_execution_price(frame, price_col)
     pivot = (
         frame.loc[:, ["date", "code", "execution_price"]]
         .pivot(index="date", columns="code", values="execution_price")
