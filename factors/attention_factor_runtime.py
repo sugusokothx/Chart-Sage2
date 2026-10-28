@@ -380,6 +380,9 @@ def normalize_attention_input_frame(inputs: pd.DataFrame) -> pd.DataFrame:
         out["shares_outstanding"] = pd.to_numeric(inputs[shares_col], errors="coerce")
     else:
         out["shares_outstanding"] = np.nan
+    basis_status_col = col("shares_basis_status")
+    if basis_status_col is not None:
+        out["shares_basis_status"] = inputs[basis_status_col]
     return out.dropna(subset=["code", "Date"])
 
 
@@ -414,6 +417,13 @@ def compute_attention_from_inputs(
         shares_series = pd.to_numeric(group.get("shares_outstanding", pd.Series(dtype=float)), errors="coerce").dropna()
         shares = float(shares_series.iloc[-1]) if not shares_series.empty else np.nan
         metrics = compute_attention_metrics(group[["Date", "Close", "Volume"]], shares, asof_date=asof_date)
+        basis_status = group.get("shares_basis_status", pd.Series(dtype=object)).dropna()
+        basis_status = basis_status.iloc[-1] if not basis_status.empty else None
+        if basis_status == "ambiguous":
+            shares = np.nan
+            metrics["turnover"] = np.nan
+            if metrics.get("status") == "ok":
+                metrics["status"] = "ambiguous_shares_basis"
         rows.append(
             {
                 "code": code,
@@ -421,6 +431,7 @@ def compute_attention_from_inputs(
                 "ticker": ticker,
                 "yf_ticker": ticker,
                 "shares_outstanding": shares,
+                "shares_basis_status": basis_status,
                 "rebalance_date": rebalance_date,
                 "asof_date": asof_date,
                 **metrics,

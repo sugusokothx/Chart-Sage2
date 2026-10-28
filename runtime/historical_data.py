@@ -88,6 +88,7 @@ def _lower_rename(frame: pd.DataFrame, schema_name: str | None = None) -> pd.Dat
         "adjustmentclose": "adjustment_close",
         "adjusted_close": "adjustment_close",
         "sharesoutstanding": "shares_outstanding",
+        "sharesbasisdate": "shares_basis_date",
         "listedshares": "shares_outstanding",
         "index_name": "index_code",
     }
@@ -107,6 +108,60 @@ def read_local_table(path: str | Path) -> pd.DataFrame:
     if path.suffix.lower() in {".csv", ".txt"}:
         return pd.read_csv(path, dtype=str, low_memory=False)
     raise ValueError(f"Unsupported local data file type: {path}")
+
+
+def rebase_derived_price_adjustments(frame: pd.DataFrame) -> pd.DataFrame:
+    """Put OHLCV derived from daily factors on one basis across cached months.
+
+    Bulk CSV has no adjusted OHLCV, so the builder derives it per shard. Older
+    caches have no source marker; recognize them only when both adjusted close
+    and volume match the month-local factors for every row of a code. Preserve
+    other supplied adjustments, including API prices on a different basis.
+    """
+
+    required = {"date", "code", "close", "volume", "adjustment_factor", "adjustment_close", "adjustment_volume"}
+    if frame.empty or not required.issubset(frame.columns):
+        return frame
+    work = frame.sort_values(["code", "date"], ascending=[True, False])
+    codes = work["code"]
+    factor = pd.to_numeric(work["adjustment_factor"], errors="coerce")
+    valid = factor.gt(0) & np.isfinite(factor)
+    cumulative = factor.where(valid, 1.0).groupby(codes).cumprod()
+    multiplier = cumulative.groupby(codes).shift(1, fill_value=1.0)
+    months = pd.to_datetime(work["date"]).dt.to_period("M")
+    month_basis = multiplier.groupby([codes, months]).transform("first")
+    local_multiplier = multiplier / month_basis
+
+    close = pd.to_numeric(work["close"], errors="coerce")
+    volume = pd.to_numeric(work["volume"], errors="coerce")
+    local_match = pd.Series(True, index=work.index)
+    for col, expected in [("adjustment_close", close * local_multiplier), ("adjustment_volume", volume / local_multiplier)]:
+        actual = pd.to_numeric(work[col], errors="coerce")
+        local_match &= np.isclose(actual, expected, rtol=1e-8, atol=1e-8, equal_nan=True)
+    derived = (
+        work["adjustment_source"].eq("daily_factors").fillna(False)
+        if "adjustment_source" in work.columns
+        else pd.Series(False, index=work.index)
+    )
+    complete = (valid & multiplier.gt(0) & np.isfinite(multiplier) & (derived | local_match)).groupby(codes).all()
+    repair = codes.isin(complete.index[complete])
+    if not repair.any():
+        return frame
+
+    out = frame.copy()
+    selected = work.index[repair]
+    for src in ["open", "high", "low", "close", "volume"]:
+        dst = f"adjustment_{src}"
+        if src not in work.columns or dst not in work.columns:
+            continue
+        raw = pd.to_numeric(work.loc[selected, src], errors="coerce")
+        scale = multiplier.loc[selected]
+        out[dst] = pd.to_numeric(out[dst], errors="coerce").astype(float)
+        out.loc[selected, dst] = raw / scale if src == "volume" else raw * scale
+    if "adjustment_source" not in out.columns:
+        out["adjustment_source"] = pd.Series(index=out.index, dtype=object)
+    out.loc[selected, "adjustment_source"] = "daily_factors"
+    return out
 
 
 def _flag_unreliable_adjusted_prices(frame: pd.DataFrame) -> pd.DataFrame:
@@ -177,7 +232,7 @@ def validate_nonempty_table(frame: pd.DataFrame, schema_name: str, path: str | P
 
 def _coerce_date_columns(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
-    for col in ["date", "asof_date", "disclosed_date", "published_date"]:
+    for col in ["date", "asof_date", "disclosed_date", "published_date", "current_period_end", "shares_basis_date"]:
         if col in out.columns:
             out[col] = pd.to_datetime(out[col], errors="coerce").dt.tz_localize(None)
     if "code" in out.columns:
@@ -208,6 +263,85 @@ def _latest_per_code(frame: pd.DataFrame, date_col: str, asof_date: pd.Timestamp
     if work.empty:
         return work
     return work.sort_values(["code", date_col]).groupby("code", as_index=False).tail(1)
+
+
+def _codes_with_adjusted_volume(prices: pd.DataFrame) -> set[str]:
+    """Codes whose adjusted close and volume cover every row with a raw volume."""
+
+    if prices.empty or not {"adjustment_close", "adjustment_volume"}.issubset(prices.columns):
+        return set()
+    covered = prices["adjustment_close"].notna() & prices["adjustment_volume"].notna()
+    complete = (covered | prices["volume"].isna()).groupby(prices["code"]).all()
+    return set(complete.index[complete])
+
+
+def _adjusted_volume_ratio_on(prices: pd.DataFrame, shares: pd.DataFrame) -> pd.DataFrame:
+    """adjusted / raw volume on each code's shares_basis_date.
+
+    The ratio is constant between corporate actions, so the nearest trading
+    day before the basis date is used, or the first one after it when the
+    basis date predates the code's prices (e.g. a period end before listing).
+    """
+
+    volume = pd.to_numeric(prices["volume"], errors="coerce")
+    adjusted_volume = pd.to_numeric(prices["adjustment_volume"], errors="coerce")
+    rows = prices.loc[volume.gt(0) & adjusted_volume.gt(0), ["code", "date"]].copy()
+    rows["shares_to_adjusted"] = adjusted_volume / volume
+    # Caches can mix datetime resolutions (ns/us); merge_asof needs one.
+    rows["date"] = rows["date"].astype("datetime64[ns]")
+    rows = rows.sort_values("date")
+    left = shares.loc[shares["shares_basis_date"].notna(), ["code", "shares_basis_date"]].copy()
+    left["shares_basis_date"] = left["shares_basis_date"].astype("datetime64[ns]")
+    left = left.sort_values("shares_basis_date")
+    if left.empty or rows.empty:
+        return pd.DataFrame({"code": pd.Series(dtype=object), "shares_to_adjusted": pd.Series(dtype=float)})
+    matched = {}
+    for direction in ["backward", "forward"]:
+        matched[direction] = pd.merge_asof(
+            left, rows, left_on="shares_basis_date", right_on="date", by="code", direction=direction
+        ).set_index("code")["shares_to_adjusted"]
+    ratio = matched["backward"].fillna(matched["forward"])
+    return ratio.rename("shares_to_adjusted").reset_index()
+
+
+def _ambiguous_financial_share_codes(prices: pd.DataFrame, shares: pd.DataFrame) -> set[str]:
+    """Find inferred share bases crossed by an action before disclosure.
+
+    ShOutFY/AvgSh may already restate those actions. Their numeric values alone
+    cannot distinguish a restatement from changes in issued shares. Inspect
+    individual events, not just the net factor (a split and consolidation can
+    cancel), and never infer the presentation basis from a later disclosure.
+    """
+
+    candidates = shares.loc[
+        shares["shares_basis_status"].eq("period_end")
+        & shares["shares_basis_date"].lt(shares["disclosed_date"]),
+        ["code", "shares_basis_date", "disclosed_date"],
+    ]
+    if candidates.empty:
+        return set()
+    work = prices.loc[prices["code"].isin(candidates["code"])].sort_values(["code", "date"])
+    action = pd.Series(False, index=work.index)
+    factor_known = pd.Series(False, index=work.index)
+    if "adjustment_factor" in work.columns:
+        factor = pd.to_numeric(work["adjustment_factor"], errors="coerce")
+        factor_known = factor.gt(0) & np.isfinite(factor)
+        action |= factor_known & factor.ne(1)
+    if "adjustment_volume" in work.columns:
+        volume = pd.to_numeric(work["volume"], errors="coerce")
+        adjusted = pd.to_numeric(work["adjustment_volume"], errors="coerce")
+        ratio = (adjusted / volume).where(volume.gt(0) & adjusted.gt(0))
+        previous = ratio.groupby(work["code"]).ffill().groupby(work["code"]).shift(1)
+        # Prefer daily factors: rounded adjusted volumes need not have a
+        # perfectly constant ratio between actions. When factors are missing,
+        # allow one share of rounding at either end of the comparison.
+        rounding = (1.0 / volume).where(ratio.notna())
+        previous_rounding = rounding.groupby(work["code"]).ffill().groupby(work["code"]).shift(1)
+        complete_factors = factor_known.groupby(work["code"]).transform("all")
+        action |= ~complete_factors & (ratio - previous).abs().gt(rounding + previous_rounding + previous.abs() * 1e-6)
+    events = work.loc[action, ["code", "date"]].merge(candidates, on="code", how="inner")
+    crossed = events["date"].gt(events["shares_basis_date"]) & events["date"].le(events["disclosed_date"])
+    return set(events.loc[crossed, "code"])
 
 
 @dataclass
@@ -254,6 +388,10 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             validate_schema(frame, name, path)
             if name in {"universe", "sector", "market_cap", "prices"}:
                 validate_nonempty_table(frame, name, path)
+            if name == "prices":
+                # Repair legacy main tables as well as newly assembled shards,
+                # before their month-boundary resets are flagged as bad data.
+                frame = rebase_derived_price_adjustments(frame)
         except FileNotFoundError:
             if required:
                 raise
@@ -375,23 +513,114 @@ class JpxHistoricalProvider(HistoricalDataProvider):
         jquants_api_key: str | None = None,
         config: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
-        prices = self.price_frame(universe_codes["code"], start_date, end_date)
+        """Daily close/volume plus shares outstanding for the attention factor.
+
+        close/volume are split-adjusted for codes with adjusted prices across
+        the window, so a split inside the 13-month window does not read as
+        abnormal volume. Shares are rescaled from their reported basis date.
+        If a split crosses the period-end/disclosure interval, an explicit
+        shares_basis_date is required: ShOutFY/AvgSh may already reflect it.
+        Ambiguous counts stay missing instead of producing biased turnover.
+        raw_close, raw_volume and shares_reported keep the source values.
+        """
+
+        end = pd.Timestamp(end_date).normalize()
+        codes = universe_codes["code"].dropna().astype(str).tolist()
+        prices = self.price_frame(codes, start_date, end)
+        prices["raw_close"] = prices["close"]
+        prices["raw_volume"] = prices["volume"]
+
+        shares = self._attention_shares(codes, end)
+        adjusted = _codes_with_adjusted_volume(prices)
+        if adjusted and not shares.empty:
+            basis_start = shares.loc[shares["code"].isin(adjusted), "shares_basis_date"].min()
+            if pd.notna(basis_start):
+                basis_prices = self.price_frame(sorted(adjusted), min(basis_start, pd.Timestamp(start_date)), end)
+                shares = shares.merge(_adjusted_volume_ratio_on(basis_prices, shares), on="code", how="left")
+        if "shares_to_adjusted" not in shares.columns:
+            shares["shares_to_adjusted"] = np.nan
+        ambiguous = shares["shares_basis_status"].eq("ambiguous")
+        # Without a ratio on the basis date the shares cannot be rescaled, so
+        # those codes stay on raw prices.
+        rescalable = set(shares.loc[shares["shares_to_adjusted"].notna(), "code"])
+        unrescaled = set(shares.loc[~ambiguous, "code"]) - rescalable
+        adjusted -= unrescaled
+        shares.loc[~shares["code"].isin(adjusted), "shares_to_adjusted"] = 1.0
+        shares.loc[ambiguous, "shares_to_adjusted"] = np.nan
+        shares["shares_outstanding"] = shares["shares_reported"] * shares["shares_to_adjusted"]
+
+        if adjusted:
+            use_adjusted = prices["code"].isin(adjusted)
+            prices.loc[use_adjusted, "close"] = prices.loc[use_adjusted, "adjustment_close"]
+            prices.loc[use_adjusted, "volume"] = prices.loc[use_adjusted, "adjustment_volume"]
+
+        merged = prices.merge(shares[["code", "shares_reported", "shares_basis_date", "shares_basis_status", "shares_to_adjusted", "shares_outstanding"]], on="code", how="left")
         caps = self.table("market_cap", required=False, copy=False)
         if caps.empty:
-            prices["shares_outstanding"] = np.nan
-            return prices
-        caps = caps.loc[caps["asof_date"] <= pd.Timestamp(end_date).normalize()].sort_values(["code", "asof_date"])
-        latest = caps.groupby("code", as_index=False).tail(1)[["code", "market_cap", *([ "shares_outstanding"] if "shares_outstanding" in caps.columns else [])]].copy()
+            merged["market_cap"] = np.nan
+            return merged
+        latest = _latest_per_code(caps, "asof_date", end, codes)[["code", "market_cap"]].copy()
         # CSV caches are read as strings; parse before dividing by close.
-        for col in ["market_cap", "shares_outstanding"]:
-            if col in latest.columns:
-                latest[col] = pd.to_numeric(latest[col], errors="coerce")
-        merged = prices.merge(latest, on="code", how="left")
-        if "shares_outstanding" not in merged.columns:
-            merged["shares_outstanding"] = np.nan
-        missing_shares = merged["shares_outstanding"].isna()
+        latest["market_cap"] = pd.to_numeric(latest["market_cap"], errors="coerce")
+        merged = merged.merge(latest, on="code", how="left")
+        # market_cap / close is on the same basis as close, adjusted or raw.
+        # Cap caches can be derived from the same ambiguous financial count;
+        # using them here would silently reintroduce the rejected assumption.
+        missing_shares = merged["shares_outstanding"].isna() & ~merged["shares_basis_status"].eq("ambiguous")
         merged.loc[missing_shares, "shares_outstanding"] = merged.loc[missing_shares, "market_cap"] / merged.loc[missing_shares, "close"].replace(0, np.nan)
         return merged
+
+    def _attention_shares(self, codes: Iterable[str], asof: pd.Timestamp) -> pd.DataFrame:
+        """Latest share count per code on or before asof, with the date it counts at.
+
+        An explicit shares_basis_date identifies the presentation basis of
+        ShOutFY (AvgSh when absent). Otherwise use the period end only when no
+        action intervenes before disclosure. Legacy caches without period ends
+        retain the disclosed-date assumption. Codes without financial shares
+        fall back to the market_cap table's shares at its asof_date.
+        """
+
+        code_set = set(codes)
+        frames: list[pd.DataFrame] = []
+        fin = self.table("financial_summary", required=False, copy=False)
+        if not fin.empty and {"shares_outstanding", "avg_shares"} & set(fin.columns):
+            work = fin.loc[fin["code"].isin(code_set) & (fin["disclosed_date"] <= asof)].copy()
+            reported = pd.Series(np.nan, index=work.index)
+            for col in ["shares_outstanding", "avg_shares"]:
+                if col in work.columns:
+                    reported = reported.fillna(pd.to_numeric(work[col], errors="coerce"))
+            work["shares_reported"] = reported
+            period_end = (
+                pd.to_datetime(work["current_period_end"], errors="coerce")
+                if "current_period_end" in work.columns
+                else pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+            )
+            explicit = (
+                pd.to_datetime(work["shares_basis_date"], errors="coerce")
+                if "shares_basis_date" in work.columns
+                else pd.Series(pd.NaT, index=work.index, dtype="datetime64[ns]")
+            )
+            work["shares_basis_date"] = explicit.fillna(period_end).fillna(work["disclosed_date"])
+            work["shares_basis_status"] = np.where(explicit.notna(), "explicit", np.where(period_end.notna(), "period_end", "disclosed_date"))
+            work.loc[work["shares_basis_date"].gt(work["disclosed_date"]), "shares_basis_status"] = "ambiguous"
+            work = work.loc[work["shares_reported"].gt(0)]
+            work = _latest_per_code(work, "disclosed_date", asof)
+            ambiguous = _ambiguous_financial_share_codes(self.table("prices", copy=False), work)
+            work.loc[work["code"].isin(ambiguous), "shares_basis_status"] = "ambiguous"
+            frames.append(work[["code", "shares_reported", "shares_basis_date", "shares_basis_status"]])
+        found = set(frames[0]["code"]) if frames else set()
+        caps = self.table("market_cap", required=False, copy=False)
+        if not caps.empty and "shares_outstanding" in caps.columns:
+            work = caps.loc[caps["code"].isin(code_set - found)].copy()
+            work["shares_reported"] = pd.to_numeric(work["shares_outstanding"], errors="coerce")
+            work["shares_basis_date"] = work["asof_date"]
+            work["shares_basis_status"] = "market_cap"
+            work = work.loc[work["shares_reported"].gt(0)]
+            frames.append(_latest_per_code(work, "asof_date", asof)[["code", "shares_reported", "shares_basis_date", "shares_basis_status"]])
+        frames = [frame for frame in frames if not frame.empty]
+        if not frames:
+            return pd.DataFrame({"code": pd.Series(dtype=object), "shares_reported": pd.Series(dtype=float), "shares_basis_date": pd.Series(dtype="datetime64[ns]"), "shares_basis_status": pd.Series(dtype=object)})
+        return pd.concat(frames, ignore_index=True)
 
     def load_behaviour_inputs(
         self,

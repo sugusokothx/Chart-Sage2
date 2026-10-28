@@ -458,6 +458,34 @@ Current provider method:
 
 - `JpxHistoricalProvider.load_attention_inputs(...)`
 
+The loader puts volume and shares on the same split-adjusted basis. Financial
+`shares_outstanding` (`avg_shares` as a fallback) may already reflect a split
+between `current_period_end` and `disclosed_date`. The J-Quants financial summary
+preserves the disclosed figures; the count alone does not identify its split
+basis ([API specification](https://jpx-jquants.com/ja/spec/fin-summary)).
+
+For such records, a local financial-summary cache can supply the optional
+`shares_basis_date`: a date whose raw share units match the reported count,
+verified from the disclosure and no later than `disclosed_date`. For example,
+after a 2-for-1 split on September 1, an unadjusted June count of 1 million
+uses June 30; a count already restated to 2 million in the September 15
+disclosure uses September 15. This is local metadata, not a native J-Quants
+field; normalization preserves it but does not infer it.
+
+Without explicit metadata, the loader uses the period end when no action
+intervenes before disclosure. If an action does intervene, it retains
+`shares_reported` but leaves rescaled shares and turnover missing, reports
+`ambiguous_shares_basis` in attention detail, and excludes that code from
+attention scoring. It also blocks market-cap fallback for that count, since
+the cap may have been derived from the same ambiguous shares. Adjusted volume
+remains available for `avol`. Legacy caches without `current_period_end` retain
+the disclosure-date assumption; add verified basis metadata for restatements.
+
+The attention factor cache version changes with this correction, so previous
+attention results are recomputed. If you subsequently correct source data or
+add basis metadata, clear the affected attention factor cache entries before
+rerunning; cache keys intentionally do not hash the local input files.
+
 ### Behaviour-input loader
 
 Used when a factor needs margin data, market cap, and trading-value context.

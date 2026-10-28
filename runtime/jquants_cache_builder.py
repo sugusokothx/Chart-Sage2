@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from historical_data import JpxHistoricalProvider, LocalDataPaths, normalize_code
+from historical_data import JpxHistoricalProvider, LocalDataPaths, normalize_code, rebase_derived_price_adjustments
 
 
 JQUANTS_CACHE_BUILDER_VERSION = "2026-04-18-full-month-cache"
@@ -1141,6 +1141,14 @@ FINS_SUMMARY_USECOL_CANDIDATES: tuple[str, ...] = (
     "shoutfy",
     "AvgSh",
     "avgsh",
+    # Accounting period end; the reported shares may already restate a split.
+    "CurPerEn",
+    "curperen",
+    "CurrentPeriodEndDate",
+    "current_period_end",
+    # Optional local/export metadata, not a native J-Quants response field.
+    "SharesBasisDate",
+    "shares_basis_date",
 )
 
 
@@ -1889,6 +1897,7 @@ def load_or_download_price_shards(
         return pd.DataFrame(columns=["date", "code", "open", "high", "low", "close", "volume"])
     data = pd.concat(frames, ignore_index=True)
     data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.tz_localize(None)
+    data = rebase_derived_price_adjustments(data)
     return data.loc[data["date"].between(start, end, inclusive="both")].reset_index(drop=True)
 
 
@@ -2267,6 +2276,7 @@ def normalize_jquants_prices(raw: pd.DataFrame) -> pd.DataFrame:
             work[dst] = pd.to_numeric(work[src], errors="coerce") * pd.to_numeric(work["_adj_multiplier"], errors="coerce")
         multiplier = pd.to_numeric(work["_adj_multiplier"], errors="coerce").replace(0, np.nan)
         work["adjustment_volume"] = pd.to_numeric(work["volume"], errors="coerce") / multiplier
+        work["adjustment_source"] = "daily_factors"
         out = work.drop(columns=["_cum_factor", "_adj_multiplier"]).sort_values(["code", "date"], kind="mergesort")
         _cell5_log("daily_quotes adjusted OHLCV derived from AdjFactor")
     log_cache_value_diagnostics("daily_quotes normalized", "prices", out)
@@ -2427,6 +2437,9 @@ def normalize_jquants_statements(raw: pd.DataFrame) -> pd.DataFrame:
             "disc_no": _series(raw, "DiscNo", "disc_no", default=pd.NA),
             "doc_type": _series(raw, "DocType", "doc_type", default=pd.NA),
             "period_type": _series(raw, "CurPerType", "period_type", "cur_per_type", default=pd.NA),
+            # The period end alone does not identify the split basis of ShOutFY.
+            "current_period_end": pd.to_datetime(_series(raw, "CurPerEn", "CurrentPeriodEndDate", "current_period_end", default=pd.NA), errors="coerce"),
+            "shares_basis_date": pd.to_datetime(_series(raw, "SharesBasisDate", "shares_basis_date", default=pd.NA), errors="coerce"),
             "code": _series(raw, "LocalCode", "Code", "IssueCode", "local_code", "code", "issue_code").map(normalize_code),
             "total_revenue": pd.to_numeric(_series(raw, "Sales", "NetSales", "net_sales", "Revenue", "revenue", "sales", "OperatingRevenue", "operating_revenue"), errors="coerce"),
             "operating_income": pd.to_numeric(_series(raw, "OP", "OperatingProfit", "operating_profit", "OperatingIncome", "operating_income", "BusinessProfit", "business_profit"), errors="coerce"),

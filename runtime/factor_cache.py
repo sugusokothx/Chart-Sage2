@@ -10,6 +10,15 @@ import pandas as pd
 
 
 CACHE_VERSION = "single_factor_cache_v2_overlap_reuse"
+# Recompute affected factors without invalidating unrelated caches. Old
+# attention results assumed every financial share count was on the period
+# end's basis. dual_ma and residual_momentum prefer adjustment_close, which
+# monthly bulk caches used to derive per month instead of across the history.
+FACTOR_CACHE_VERSIONS = {
+    "attention": "attention_v3_split_share_basis",
+    "dual_ma": "dual_ma_v3_cross_month_adjustment",
+    "residual_momentum": "residual_momentum_v3_cross_month_adjustment",
+}
 
 
 @dataclass(frozen=True)
@@ -109,7 +118,7 @@ def build_factor_cache_lookup(
 ) -> FactorCacheLookup:
     anchor = pd.Timestamp(anchor_date).normalize()
     payload = {
-        "cache_version": CACHE_VERSION,
+        "cache_version": FACTOR_CACHE_VERSIONS.get(factor_name, CACHE_VERSION),
         "factor_name": factor_name,
         "anchor_date": anchor.strftime("%Y-%m-%d"),
         "universe_hash": universe_fingerprint(universe),
@@ -173,7 +182,7 @@ def save_factor_cache(lookup: FactorCacheLookup, result: Mapping[str, Any]) -> N
     summary.update({"cache_status": "saved", "cache_key": lookup.cache_key})
     lookup.summary_path.write_text(json.dumps(_json_safe(summary), ensure_ascii=False, indent=2), encoding="utf-8")
     metadata = {
-        "cache_version": CACHE_VERSION,
+        "cache_version": FACTOR_CACHE_VERSIONS.get(lookup.factor_name, CACHE_VERSION),
         "factor_name": lookup.factor_name,
         "anchor_date": lookup.anchor_date.strftime("%Y-%m-%d"),
         "cache_key": lookup.cache_key,
