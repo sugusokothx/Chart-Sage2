@@ -494,6 +494,21 @@ Current provider method:
 
 - `JpxHistoricalProvider.load_behaviour_inputs(...)`
 
+Rows are margin weeks with `code`, `date` (application date),
+`margin_buy_balance` and `margin_sell_balance`, optionally
+`margin_buy_change` / `margin_sell_change`, plus `market_cap_jpy`,
+`avg_daily_trading_value` and `close`. Balances and changes count shares, so
+the factor values them at `close`, the raw close on the application date, before
+dividing by market cap or trading value. The score averages winsorized
+z-scores of three components:
+
+- buy/sell balance log ratio;
+- weekly buy change minus sell change, each as a share of market cap;
+- buy balance as a share of market cap.
+
+Without `close`, the last two components are left out rather than mixing
+shares with JPY.
+
 ### Fundamental loader
 
 Used by point-in-time statement factors.

@@ -149,6 +149,7 @@ def normalize_behaviour_input_frame(inputs: pd.DataFrame) -> pd.DataFrame:
     sell_change_col = col("margin_sell_change", "MarginSellChange", "short_margin_change", "credit_sell_change")
     market_cap_col = col("market_cap_jpy", "MarketCap")
     adv_col = col("avg_daily_trading_value", "AvgDailyTradingValue")
+    close_col = col("close", "Close", "margin_date_close")
 
     missing = [
         name
@@ -173,6 +174,7 @@ def normalize_behaviour_input_frame(inputs: pd.DataFrame) -> pd.DataFrame:
             "margin_sell_change": pd.to_numeric(inputs[sell_change_col], errors="coerce") if sell_change_col else np.nan,
             "market_cap_jpy": pd.to_numeric(inputs[market_cap_col], errors="coerce") if market_cap_col else np.nan,
             "avg_daily_trading_value": pd.to_numeric(inputs[adv_col], errors="coerce") if adv_col else np.nan,
+            "close": pd.to_numeric(inputs[close_col], errors="coerce") if close_col else np.nan,
         }
     )
     return out.dropna(subset=["code", "date"])
@@ -219,21 +221,28 @@ def compute_latest_behaviour_rows(
     sell = numeric_detail_series(detail, "margin_sell_balance")
     buy_chg = numeric_detail_series(detail, "margin_buy_change")
     sell_chg = numeric_detail_series(detail, "margin_sell_change")
-    mcap = numeric_detail_series(detail, "market_cap_jpy")
-    adv = numeric_detail_series(detail, "avg_daily_trading_value")
+    mcap = numeric_detail_series(detail, "market_cap_jpy").replace(0, np.nan)
+    adv = numeric_detail_series(detail, "avg_daily_trading_value").replace(0, np.nan)
+    # Balances and changes count shares; at the margin-date close they are
+    # JPY, comparable with market cap and trading value across price levels.
+    close = numeric_detail_series(detail, "close").where(lambda x: x > 0)
+
+    def winsorized_z(series: pd.Series) -> pd.Series:
+        return zscore_series(winsorize_series(series, float(config["winsor_lower_q"]), float(config["winsor_upper_q"])))
 
     detail["credit_pressure"] = np.log1p(buy.clip(lower=0)) - np.log1p(sell.clip(lower=0))
-    detail["credit_change"] = zscore_series(buy_chg) - zscore_series(sell_chg)
-    detail["margin_buy_to_mcap"] = buy / mcap.replace(0, np.nan)
-    detail["margin_sell_to_mcap"] = sell / mcap.replace(0, np.nan)
-    detail["margin_buy_to_adv"] = buy / adv.replace(0, np.nan)
+    detail["margin_buy_change_to_mcap"] = buy_chg * close / mcap
+    detail["margin_sell_change_to_mcap"] = sell_chg * close / mcap
+    detail["credit_change"] = winsorized_z(detail["margin_buy_change_to_mcap"]) - winsorized_z(detail["margin_sell_change_to_mcap"])
+    detail["margin_buy_to_mcap"] = buy * close / mcap
+    detail["margin_sell_to_mcap"] = sell * close / mcap
+    detail["margin_buy_to_adv"] = buy * close / adv
 
-    raw_components = [
-        zscore_series(winsorize_series(detail["credit_pressure"], float(config["winsor_lower_q"]), float(config["winsor_upper_q"]))),
-        zscore_series(detail["credit_change"]),
-    ]
+    raw_components = [winsorized_z(detail["credit_pressure"])]
+    if detail["credit_change"].notna().sum() >= 2:
+        raw_components.append(zscore_series(detail["credit_change"]))
     if detail["margin_buy_to_mcap"].notna().sum() >= 2:
-        raw_components.append(zscore_series(detail["margin_buy_to_mcap"]))
+        raw_components.append(winsorized_z(detail["margin_buy_to_mcap"]))
     detail["credit_raw"] = pd.concat(raw_components, axis=1).mean(axis=1, skipna=True)
     detail["credit_residual_factor"] = zscore_series(detail["credit_raw"])
     detail.loc[~detail["status"].eq("ok"), "credit_residual_factor"] = np.nan
