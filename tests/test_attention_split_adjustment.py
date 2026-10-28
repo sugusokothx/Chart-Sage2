@@ -291,7 +291,7 @@ def test_offsetting_actions_before_disclosure_still_leave_basis_unknown(tmp_path
     assert pd.isna(detail.loc["1001", "turnover"])
 
 
-@pytest.mark.parametrize("factor", ["attention", "dual_ma", "residual_momentum"])
+@pytest.mark.parametrize("factor", ["attention", "dual_ma", "residual_momentum", "quality", "value"])
 def test_old_factor_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factor: str) -> None:
     provider = JpxHistoricalProvider(LocalDataPaths(data_dir=tmp_path))
     def lookup(name: str):
@@ -303,10 +303,10 @@ def test_old_factor_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.Monk
     result = {"minimal": pd.DataFrame({"code": ["1001"], "factor_value": [1.0]}), "summary": {}}
     with monkeypatch.context() as old:
         old.setattr(factor_cache, "FACTOR_CACHE_VERSIONS", {})
-        for name in [factor, "value"]:
+        for name in [factor, "reversal"]:
             factor_cache.save_factor_cache(lookup(name), result)
     assert factor_cache.load_factor_cache(lookup(factor)) is None
-    assert factor_cache.load_factor_cache(lookup("value")) is not None
+    assert factor_cache.load_factor_cache(lookup("reversal")) is not None
     factor_cache.save_factor_cache(lookup(factor), result)
     assert factor_cache.load_factor_cache(lookup(factor)) is not None
 

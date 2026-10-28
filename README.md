@@ -525,6 +525,21 @@ Expected output is a point-in-time panel keyed by `code`, typically including fi
 - `OperatingCashFlow`
 - `FreeCashFlow`
 
+`financial_summary` keeps every disclosure; rows are duplicates only when
+`disc_no` repeats. Earnings and dividend forecast revisions carry no statement
+figures, often share a disclosed date with the statement, and may follow it
+later. Statement fields, attention shares, and market caps built from
+financial shares therefore come from the latest disclosure carrying those
+figures. Same-day late filings and later corrections resolve to the newest
+`current_period_end`, then the latest version of that period.
+
+Caches built before this change kept one row per `disclosed_date` and code,
+sometimes a revision instead of the statement. To recover them, delete
+`financial_summary.parquet`/`.csv` and the monthly `financial_summary_YYYYMM`
+files, then rebuild. Daily shards under `financial_summary/` are complete and
+can stay. Rebuild `market_cap` as well when it was derived from financial
+shares (`market_cap_source` starting with `fins_summary_shares`).
+
 ### Wide close-price loader
 
 Used by the public momentum module.

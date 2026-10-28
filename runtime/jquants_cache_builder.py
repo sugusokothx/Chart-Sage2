@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from historical_data import JpxHistoricalProvider, LocalDataPaths, normalize_code, rebase_derived_price_adjustments
+from historical_data import JpxHistoricalProvider, LocalDataPaths, financial_disclosures_by_day, normalize_code, rebase_derived_price_adjustments
 
 
 JQUANTS_CACHE_BUILDER_VERSION = "2026-04-18-full-month-cache"
@@ -1196,6 +1196,12 @@ def _read_fins_summary_month_cache(data_dir: Path, month: str) -> pd.DataFrame |
     return None
 
 
+def _financial_summary_keys(frame: pd.DataFrame) -> list[str]:
+    # Statements and forecast revisions often share a disclosed date; each
+    # disclosure has its own number.
+    return ["disclosed_date", "code", "disc_no"] if "disc_no" in frame.columns else ["disclosed_date", "code"]
+
+
 def _slice_financial_summary_month_from_main(frame: pd.DataFrame, month: str) -> pd.DataFrame:
     if frame.empty or "disclosed_date" not in frame.columns:
         return pd.DataFrame(columns=["disclosed_date", "code"])
@@ -1207,7 +1213,7 @@ def _slice_financial_summary_month_from_main(frame: pd.DataFrame, month: str) ->
     if out.empty:
         return pd.DataFrame(columns=work.columns)
     out["disclosed_date"] = pd.to_datetime(out["disclosed_date"], errors="coerce").dt.tz_localize(None)
-    return out.drop_duplicates(["disclosed_date", "code"], keep="last").reset_index(drop=True)
+    return out.drop_duplicates(_financial_summary_keys(out), keep="last").reset_index(drop=True)
 
 
 def _write_fins_summary_month_cache(frame: pd.DataFrame, data_dir: Path, month: str, save_format: str) -> Path:
@@ -1733,6 +1739,8 @@ def _append_existing(data_dir: Path, name: str, frame: pd.DataFrame, keys: list[
         for key in subset:
             if key in {"date", "asof_date", "disclosed_date", "published_date"}:
                 key_frame[key] = pd.to_datetime(key_frame[key], errors="coerce").dt.normalize()
+            elif key == "disc_no":
+                key_frame[key] = key_frame[key].astype("string")
         frame = frame.loc[~key_frame.duplicated(keep="last")]
     return _write_table(frame, data_dir, name, save_format)
 
@@ -1974,7 +1982,8 @@ def load_or_download_financial_summary_shards(
         return pd.DataFrame(columns=["disclosed_date", "code"])
     out = pd.concat(frames, ignore_index=True)
     out["disclosed_date"] = pd.to_datetime(out["disclosed_date"], errors="coerce").dt.tz_localize(None)
-    return out.loc[out["disclosed_date"].between(start, end, inclusive="both")].drop_duplicates(["disclosed_date", "code"], keep="last").reset_index(drop=True)
+    out = out.loc[out["disclosed_date"].between(start, end, inclusive="both")]
+    return out.drop_duplicates(_financial_summary_keys(out), keep="last").reset_index(drop=True)
 
 
 def load_or_download_margin_shards(
@@ -2715,7 +2724,10 @@ def build_market_cap_from_financial_shares(
         share_value = share_value.fillna(pd.to_numeric(shares["avg_shares"], errors="coerce"))
     shares["shares_outstanding"] = share_value
     shares = shares.dropna(subset=["disclosed_date", "code", "shares_outstanding"])
-    shares = shares.loc[shares["shares_outstanding"].gt(0), ["disclosed_date", "code", "shares_outstanding"]]
+    shares = shares.loc[shares["shares_outstanding"].gt(0)]
+    # Same-day disclosures (late filings, corrections) resolve to the newest
+    # period, as the provider's loaders do.
+    shares = financial_disclosures_by_day(shares)[["disclosed_date", "code", "shares_outstanding"]]
     if shares.empty:
         raise RuntimeError("Cannot build market_cap from financial shares: no positive disclosed shares values.")
 
@@ -3121,7 +3133,7 @@ def download_jquants_backtest_cache(
                     f"error={exc!r}"
                 )
                 financials = pd.DataFrame(columns=["disclosed_date", "code"])
-            outputs["financial_summary"] = _append_existing(data_path, "financial_summary", financials, ["disclosed_date", "code"], cfg.save_format)
+            outputs["financial_summary"] = _append_existing(data_path, "financial_summary", financials, ["disclosed_date", "code", "disc_no"], cfg.save_format)
         if codes and not financials.empty:
             financials = financials.loc[financials["code"].isin(set(codes))]
 
