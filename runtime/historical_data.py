@@ -247,12 +247,62 @@ def _deduplicate_table(frame: pd.DataFrame, schema_name: str) -> pd.DataFrame:
     elif schema_name in {"universe", "sector", "market_cap"} and {"asof_date", "code"}.issubset(out.columns):
         out = out.sort_values(["asof_date", "code"]).drop_duplicates(subset=["asof_date", "code"], keep="last")
     elif schema_name == "financial_summary" and {"disclosed_date", "code"}.issubset(out.columns):
-        out = out.sort_values(["disclosed_date", "code"]).drop_duplicates(subset=["disclosed_date", "code"], keep="last")
+        # A statement and a forecast revision often share a disclosed date;
+        # only a repeated disclosure number is a duplicate.
+        keys = [c for c in ["disclosed_date", "code", "disc_no"] if c in out.columns]
+        out = out.sort_values(["disclosed_date", "code"], kind="mergesort").drop_duplicates(subset=keys, keep="last")
     elif schema_name == "index_prices" and {"date", "index_code"}.issubset(out.columns):
         out = out.sort_values(["date", "index_code"]).drop_duplicates(subset=["date", "index_code"], keep="last")
     elif schema_name == "margin" and {"date", "code"}.issubset(out.columns):
         out = out.sort_values(["date", "code"]).drop_duplicates(subset=["date", "code"], keep="last")
     return out.reset_index(drop=True)
+
+
+# Only financial statements fill these; earnings and dividend forecast
+# revisions disclosed on their own leave them empty.
+FINANCIAL_STATEMENT_FIELDS = ("total_revenue", "operating_income", "net_income", "total_assets", "stockholders_equity")
+
+
+def financial_disclosures_by_day(frame: pd.DataFrame) -> pd.DataFrame:
+    """One row per (code, disclosed_date): the newest information public that day.
+
+    The newest period wins, then its latest version. Same-day late filings
+    for older periods, and later corrections of an older period, do not
+    displace a newer period already disclosed. Rows without a period end
+    (older caches) follow disclosure time and number.
+    """
+
+    if frame.empty:
+        return frame
+    work = frame.assign(
+        _period_end=pd.to_datetime(frame["current_period_end"], errors="coerce") if "current_period_end" in frame.columns else pd.NaT,
+        _time=frame["disclosed_time"].astype("string").str[:5] if "disclosed_time" in frame.columns else pd.NA,
+        _disc_no=frame["disc_no"].astype("string") if "disc_no" in frame.columns else pd.NA,
+    )
+    work = work.sort_values(["code", "disclosed_date", "_period_end", "_time", "_disc_no"], kind="mergesort", na_position="first")
+    newest_so_far = work.groupby("code")["_period_end"].cummax()
+    work = work.loc[work["_period_end"].isna() | work["_period_end"].ge(newest_so_far)]
+    work = work.groupby(["code", "disclosed_date"], sort=False).tail(1)
+    return work.drop(columns=["_period_end", "_time", "_disc_no"])
+
+
+def _latest_financial_per_code(
+    frame: pd.DataFrame,
+    asof_date: pd.Timestamp,
+    codes: Iterable[str] | None = None,
+    fields: Iterable[str] = FINANCIAL_STATEMENT_FIELDS,
+) -> pd.DataFrame:
+    """Latest disclosure per code that carries any of ``fields``."""
+
+    work = frame.loc[frame["disclosed_date"] <= asof_date]
+    if codes is not None:
+        work = work.loc[work["code"].isin(set(codes))]
+    present = [col for col in fields if col in work.columns]
+    if present:
+        work = work.loc[work[present].notna().any(axis=1)]
+    if work.empty:
+        return work.copy()
+    return financial_disclosures_by_day(work).groupby("code", sort=False).tail(1).copy()
 
 
 def _latest_per_code(frame: pd.DataFrame, date_col: str, asof_date: pd.Timestamp, codes: Iterable[str] | None = None) -> pd.DataFrame:
@@ -604,7 +654,7 @@ class JpxHistoricalProvider(HistoricalDataProvider):
             work["shares_basis_status"] = np.where(explicit.notna(), "explicit", np.where(period_end.notna(), "period_end", "disclosed_date"))
             work.loc[work["shares_basis_date"].gt(work["disclosed_date"]), "shares_basis_status"] = "ambiguous"
             work = work.loc[work["shares_reported"].gt(0)]
-            work = _latest_per_code(work, "disclosed_date", asof)
+            work = _latest_financial_per_code(work, asof, fields=["shares_reported"])
             ambiguous = _ambiguous_financial_share_codes(self.table("prices", copy=False), work)
             work.loc[work["code"].isin(ambiguous), "shares_basis_status"] = "ambiguous"
             frames.append(work[["code", "shares_reported", "shares_basis_date", "shares_basis_status"]])
@@ -674,7 +724,7 @@ class JpxHistoricalProvider(HistoricalDataProvider):
         asof = pd.Timestamp(config.get("asof_date") or config.get("rebalance_date")).normalize()
         codes = universe["code"].dropna().astype(str).tolist()
         fin = self.table("financial_summary", copy=False)
-        fin = _latest_per_code(fin, "disclosed_date", asof, codes)
+        fin = _latest_financial_per_code(fin, asof, codes)
         if fin.empty:
             out = pd.DataFrame({"code": codes})
             report = RunReport(mode="provider_internal", anchor_date=str(asof.date()))
