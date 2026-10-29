@@ -17,6 +17,7 @@ CACHE_VERSION = "single_factor_cache_v2_overlap_reuse"
 # quality, value and attention shares took the latest disclosure of any kind,
 # so a forecast revision could hide the statement before it. behaviour
 # divided margin share counts by JPY market cap, without winsorizing.
+# reversal read raw closes, so a split inside the window looked like a crash.
 FACTOR_CACHE_VERSIONS = {
     "attention": "attention_v4_statement_selection",
     "dual_ma": "dual_ma_v3_cross_month_adjustment",
@@ -24,6 +25,7 @@ FACTOR_CACHE_VERSIONS = {
     "quality": "quality_v3_statement_selection",
     "value": "value_v3_statement_selection",
     "behaviour": "behaviour_v3_margin_value_units",
+    "reversal": "reversal_v2_adjusted_close",
 }
 
 

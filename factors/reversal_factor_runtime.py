@@ -40,6 +40,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 PriceLoader = Callable[..., pd.DataFrame]
 
+# Split-adjusted closes, preferred over Close so a split does not read as a
+# crash (a 1:2 split halves the raw close) and top the reversal ranking.
+ADJUSTED_CLOSE_COLUMNS = {"adjustment_close", "adjustmentclose", "adjusted_close", "adj close"}
+
 
 # JPX codes may carry letters in the 2nd/4th position (e.g. 135A); J-Quants
 # appends a 5th digit (135A0) and tickers may carry a venue suffix (135A.T).
@@ -106,8 +110,18 @@ def _flatten_price_columns(frame: pd.DataFrame) -> pd.DataFrame:
     if isinstance(frame.columns, pd.MultiIndex):
         out = frame.copy()
         out.columns = [col[0] if isinstance(col, tuple) else col for col in out.columns]
-        return out
-    return frame
+    else:
+        out = frame
+    adjusted = [col for col in out.columns if str(col).strip().lower() in ADJUSTED_CLOSE_COLUMNS]
+    if adjusted and "AdjustmentClose" not in out.columns:
+        out = out.rename(columns={adjusted[0]: "AdjustmentClose"})
+    return out
+
+
+def _reversal_close_column(work: pd.DataFrame) -> str:
+    if "AdjustmentClose" in work.columns and pd.to_numeric(work["AdjustmentClose"], errors="coerce").notna().any():
+        return "AdjustmentClose"
+    return "Close"
 
 
 def _normalize_panel_price_frame(price_frame: pd.DataFrame) -> pd.DataFrame:
@@ -132,15 +146,17 @@ def _normalize_panel_price_frame(price_frame: pd.DataFrame) -> pd.DataFrame:
             rename_map[col] = "Close"
         elif lower == "volume":
             rename_map[col] = "Volume"
+        elif lower in ADJUSTED_CLOSE_COLUMNS and "AdjustmentClose" not in rename_map.values():
+            rename_map[col] = "AdjustmentClose"
     work = work.rename(columns=rename_map)
     if "Date" not in work.columns or "code" not in work.columns:
         return pd.DataFrame(columns=["code", "Date", "Open", "High", "Low", "Close", "Volume"])
     work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.tz_localize(None)
     work["code"] = work["code"].map(normalize_jp_code)
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
+    for col in ["Open", "High", "Low", "Close", "Volume", "AdjustmentClose"]:
         if col in work.columns:
             work[col] = pd.to_numeric(work[col], errors="coerce")
-    keep = [col for col in ["code", "Date", "Open", "High", "Low", "Close", "Volume"] if col in work.columns]
+    keep = [col for col in ["code", "Date", "Open", "High", "Low", "Close", "Volume", "AdjustmentClose"] if col in work.columns]
     return work.loc[work["Date"].notna() & work["code"].notna(), keep].sort_values(["code", "Date"]).reset_index(drop=True)
 
 
@@ -201,7 +217,8 @@ def calc_skip_reversal_detail(
         return {"reversal_factor": np.nan, "status": "empty_history"}
 
     work = _flatten_price_columns(hist).copy()
-    if "Close" not in work.columns:
+    close_col = _reversal_close_column(work)
+    if close_col not in work.columns:
         return {"reversal_factor": np.nan, "status": "missing_close"}
 
     if not isinstance(work.index, pd.DatetimeIndex):
@@ -216,7 +233,7 @@ def calc_skip_reversal_detail(
     if asof_date is not None:
         work = work.loc[work.index <= asof_date]
 
-    close = pd.to_numeric(work["Close"], errors="coerce").dropna()
+    close = pd.to_numeric(work[close_col], errors="coerce").dropna()
     required_len = skip_recent_days + lookback_window + 1
     if len(close) < required_len:
         return {

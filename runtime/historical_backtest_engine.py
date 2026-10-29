@@ -134,8 +134,11 @@ def _price_loader_for_single(provider: JpxHistoricalProvider) -> Callable[[str, 
         frame = provider.price_frame([normalized], start_date, end_date)
         if frame.empty:
             return pd.DataFrame()
-        out = frame.rename(columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-        return out.set_index("Date")[["Open", "High", "Low", "Close", "Volume"]].sort_index()
+        out = frame.rename(
+            columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume", "adjustment_close": "AdjustmentClose"}
+        )
+        columns = [col for col in ["Open", "High", "Low", "Close", "Volume", "AdjustmentClose"] if col in out.columns]
+        return out.set_index("Date")[columns].sort_index()
 
     return loader
 
