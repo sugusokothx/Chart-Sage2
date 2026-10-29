@@ -689,12 +689,37 @@ class JpxHistoricalProvider(HistoricalDataProvider):
         margin = margin.loc[margin["available_date"] <= pd.Timestamp(end_date).normalize()].copy()
         report = RunReport(mode="provider_internal", anchor_date=str(pd.Timestamp(end_date).date()))
         caps = self.get_market_caps(codes, end_date, report)[["code", "market_cap_jpy"]]
+        margin = self._with_margin_date_close(margin)
         prices = self.price_frame(codes, pd.Timestamp(end_date) - pd.Timedelta(days=120), end_date)
         if not prices.empty:
             prices["trading_value"] = prices["close"] * prices["volume"]
             adv = prices.groupby("code")["trading_value"].mean().rename("avg_daily_trading_value").reset_index()
             margin = margin.merge(adv, on="code", how="left")
         return margin.merge(caps, on="code", how="left")
+
+    def _with_margin_date_close(self, margin: pd.DataFrame) -> pd.DataFrame:
+        """Attach the raw close on or before each margin application date.
+
+        Balances count shares as of that date, so balance * close is their
+        value in JPY, comparable with market cap and trading value whatever
+        splits come later.
+        """
+
+        out = margin.drop(columns=["close"], errors="ignore")
+        if out.empty:
+            return out.assign(close=pd.Series(dtype=float))
+        prices = self.table("prices", copy=False)
+        prices = prices.loc[prices["code"].isin(set(out["code"])), ["date", "code", "close"]].dropna(subset=["date", "code"])
+        prices = prices.assign(date=pd.to_datetime(prices["date"]).astype("datetime64[ns]"), close=pd.to_numeric(prices["close"], errors="coerce"))
+        out = out.assign(_order=np.arange(len(out)), _date=pd.to_datetime(out["date"]).astype("datetime64[ns]"))
+        merged = pd.merge_asof(
+            out.sort_values("_date"),
+            prices.rename(columns={"date": "_date"}).sort_values("_date"),
+            on="_date",
+            by="code",
+            direction="backward",
+        )
+        return merged.sort_values("_order").drop(columns=["_order", "_date"]).set_index(margin.index)
 
     def _margin_available_dates(self, margin: pd.DataFrame) -> pd.Series:
         """Return when each margin row became public.

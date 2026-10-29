@@ -15,13 +15,15 @@ CACHE_VERSION = "single_factor_cache_v2_overlap_reuse"
 # end's basis. dual_ma and residual_momentum prefer adjustment_close, which
 # monthly bulk caches used to derive per month instead of across the history.
 # quality, value and attention shares took the latest disclosure of any kind,
-# so a forecast revision could hide the statement before it.
+# so a forecast revision could hide the statement before it. behaviour
+# divided margin share counts by JPY market cap, without winsorizing.
 FACTOR_CACHE_VERSIONS = {
     "attention": "attention_v4_statement_selection",
     "dual_ma": "dual_ma_v3_cross_month_adjustment",
     "residual_momentum": "residual_momentum_v3_cross_month_adjustment",
     "quality": "quality_v3_statement_selection",
     "value": "value_v3_statement_selection",
+    "behaviour": "behaviour_v3_margin_value_units",
 }
 
 

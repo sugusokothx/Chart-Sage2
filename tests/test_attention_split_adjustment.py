@@ -291,7 +291,7 @@ def test_offsetting_actions_before_disclosure_still_leave_basis_unknown(tmp_path
     assert pd.isna(detail.loc["1001", "turnover"])
 
 
-@pytest.mark.parametrize("factor", ["attention", "dual_ma", "residual_momentum", "quality", "value"])
+@pytest.mark.parametrize("factor", ["attention", "dual_ma", "residual_momentum", "quality", "value", "behaviour"])
 def test_old_factor_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factor: str) -> None:
     provider = JpxHistoricalProvider(LocalDataPaths(data_dir=tmp_path))
     def lookup(name: str):
