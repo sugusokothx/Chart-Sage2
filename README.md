@@ -605,6 +605,30 @@ report.to_frame()        # one row per check
 - A provider whose market caps are a proxy should set `market_cap_basis` to
   describe it; the check then warns that absolute JPY thresholds do not apply.
 
+### Running the CLI on an external provider (experimental)
+
+A provider kept outside this repository, for example one reading a private
+database, can drive a CLI run. The GUI does not offer this yet.
+
+```powershell
+python .\runtime\run_backtest.py --start 2025-01-01 --end 2025-12-31 --config .\configs\minimal_long_only.example.json `
+  --provider-module .\path\to\my_provider.py:MyProvider `
+  --provider-arg db_path=D:\data\research.duckdb
+```
+
+- `--provider-module` takes `FILE.py:CLASS` or `package.module:CLASS`; each
+  `--provider-arg KEY=VALUE` becomes a keyword argument, passed as a string.
+  The config can set the same as `"provider": {"module": ..., "args": {...}}`;
+  CLI options win.
+- The J-Quants credentials and local cache are not used: no download, cache
+  check or manifest. `--api-file` and `--data-dir` are ignored.
+- If the class accepts `table_start` / `table_end` and they are not given, it
+  receives the run's history window (`request_range` in the log).
+- Before the first rebalance the runner checks readiness at the backtest start
+  for the enabled factors and stops with the report if anything required is
+  missing. Warnings, such as proxy market caps, are logged.
+- The log records the argument keys only, not their values.
+
 ## How to add a new factor
 
 To add a new factor cleanly, follow this sequence.

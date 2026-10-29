@@ -8,6 +8,11 @@
 python .\runtime\run_backtest.py --start 2025-04-01 --end 2026-03-31 --api-file .\api.txt --config .\local_backtest_config.example.json --frequency monthly
 ```
 
+To run on a provider kept outside this repository instead of the J-Quants
+cache, add `--provider-module FILE.py:CLASS` and `--provider-arg KEY=VALUE`
+(experimental, CLI only; see "Running the CLI on an external provider" in the
+README).
+
 ## Credential file
 
 The CLI expects a credential file for scripted runs. Supported formats:

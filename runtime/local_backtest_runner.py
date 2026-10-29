@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
+import importlib.util
+import inspect
 import json
 import sys
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 RUNTIME_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = RUNTIME_ROOT.parent
@@ -38,6 +41,7 @@ from jquants_cache_builder import (
     infer_required_history_days,
     normalize_full_month_backtest_range,
 )
+from provider_readiness import STANDARD_FACTORS, check_provider_readiness
 from topix_pool_runtime import LiquidityRule, MarketCapRule, ScreenRules, SelectionRule, VolatilityRule
 
 
@@ -557,6 +561,91 @@ def load_provider_from_local_cache(data_dir: str | Path) -> JpxHistoricalProvide
     for table in ["prices", "universe", "sector", "market_cap"]:
         provider.table(table, copy=False)
     return provider
+
+
+def parse_provider_args(values: Iterable[str]) -> dict[str, str]:
+    args: dict[str, str] = {}
+    for item in values:
+        key, sep, value = str(item).partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--provider-arg expects KEY=VALUE, got {item!r}")
+        args[key.strip()] = value
+    return args
+
+
+def _external_provider_spec(
+    config: dict[str, Any], provider_module: str | None, provider_args: dict[str, str] | None
+) -> dict[str, Any] | None:
+    """Merge the config's "provider" section with the CLI options, which win."""
+
+    section = dict(config.get("provider") or {})
+    module = provider_module or section.get("module")
+    if not module:
+        if provider_args:
+            raise ValueError("--provider-arg needs --provider-module or a config provider.module")
+        return None
+    args = {str(key): value for key, value in dict(section.get("args") or {}).items()}
+    args.update(provider_args or {})
+    return {"module": str(module), "args": args}
+
+
+def _import_provider_factory(spec: str) -> Callable[..., Any]:
+    """Resolve "path/to/file.py:Name" or "package.module:Name"."""
+
+    target, sep, name = spec.rpartition(":")
+    if not sep or not target or not name:
+        raise ValueError(f"Provider module must look like FILE.py:CLASS or package.module:CLASS, got {spec!r}")
+    if target.endswith(".py"):
+        path = Path(target).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Provider module not found: {path}")
+        module_name = f"_external_provider_{path.stem}"
+        module_spec = importlib.util.spec_from_file_location(module_name, path)
+        if module_spec is None or module_spec.loader is None:
+            raise ImportError(f"Cannot load provider module: {path}")
+        module = importlib.util.module_from_spec(module_spec)
+        # dataclasses look their module up in sys.modules while the class is built.
+        sys.modules[module_name] = module
+        module_spec.loader.exec_module(module)
+    else:
+        module = importlib.import_module(target)
+    if not hasattr(module, name):
+        raise AttributeError(f"Provider module {target!r} has no {name!r}")
+    return getattr(module, name)
+
+
+def load_external_provider(spec: str, args: dict[str, Any], *, required: dict[str, Any], logger: TeeLogger) -> Any:
+    """Build a provider from outside this repository, e.g. a private database.
+
+    Arguments are passed as keyword strings. A provider that accepts
+    table_start / table_end gets the run's history window unless they are set,
+    so whole-table reads stay bounded.
+    """
+
+    factory = _import_provider_factory(spec)
+    kwargs = dict(args)
+    try:
+        params = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        params = {}
+    for key, value in [("table_start", required["request_start"]), ("table_end", required["request_end"])]:
+        if key in params and key not in kwargs:
+            kwargs[key] = str(pd.Timestamp(value).date())
+    provider = factory(**kwargs)
+    # Values may hold local paths or credentials; the log keeps the keys only.
+    logger.log(f"provider_loaded_from_external module={spec} provider={type(provider).__name__} arg_keys={sorted(kwargs)}")
+    return provider
+
+
+def check_external_provider(provider: Any, required: dict[str, Any], bt_config: BacktestConfig, logger: TeeLogger) -> None:
+    """Stop before the first rebalance if the provider cannot serve run_backtest()."""
+
+    factors = [name for name in bt_config.enabled_factors if name in STANDARD_FACTORS]
+    report = check_provider_readiness(provider, required["backtest_start"], factors=factors, index_code=bt_config.risk_index_code)
+    for line in report.summary().splitlines():
+        logger.log(f"provider_readiness {line}")
+    if not report.ready:
+        raise RuntimeError(f"External provider is not ready for run_backtest():\n{report.summary()}")
 
 
 def build_rules(config: dict[str, Any]) -> ScreenRules:
@@ -1305,6 +1394,127 @@ def save_backtest_outputs(
     return paths
 
 
+def _prepare_local_cache_provider(
+    *,
+    config: dict[str, Any],
+    api_file: str | Path,
+    data_dir: str | Path,
+    force_rebuild_cache: bool,
+    required: dict[str, Any],
+    logger: TeeLogger,
+) -> tuple[JpxHistoricalProvider, Path, dict[str, Any]]:
+    """Fill the J-Quants local cache for the required range and load it."""
+
+    credentials = load_api_credentials(api_file)
+    logger.log(f"api_credentials_loaded file={api_file} keys={sorted(credentials)} token_redacted=True")
+
+    cache_cfg = dict(config.get("cache", {}))
+    if force_rebuild_cache:
+        cache_cfg["force_rebuild_cache"] = True
+    data_path = Path(data_dir or cache_cfg.get("data_dir", "data_cache"))
+    save_format = str(cache_cfg.get("save_format", "parquet"))
+    api_config = JQuantsApiConfig(
+        **credentials,
+        api_version=str(cache_cfg.get("api_version", "v2")),
+        base_url=str(cache_cfg.get("base_url", "https://api.jquants.com/v2")),
+        include_margin=bool(cache_cfg.get("include_margin", True)),
+        margin_dataset=str(cache_cfg.get("margin_dataset", "weekly_margin_interest")),
+        margin_optional=bool(cache_cfg.get("margin_optional", True)),
+        allow_missing_market_cap=bool(cache_cfg.get("allow_missing_market_cap", True)),
+        market_cap_fallback=str(cache_cfg.get("market_cap_fallback", "liquidity_proxy")),
+        force_rebuild_cache=bool(cache_cfg.get("force_rebuild_cache", False)),
+        include_financials=bool(cache_cfg.get("include_financials", True)),
+        include_topix_index=bool(cache_cfg.get("include_topix_index", True)),
+        include_nikkei_index=bool(cache_cfg.get("include_nikkei_index", True)),
+        additional_index_codes=tuple(str(code).upper() for code in cache_cfg.get("additional_index_codes", [])),
+        save_format=save_format,
+        request_sleep_sec=float(cache_cfg.get("request_sleep_sec", 1.0)),
+        rate_limit_sleep_sec=float(cache_cfg.get("rate_limit_sleep_sec", 300.0)),
+        rate_limit_max_cooldowns=int(cache_cfg.get("rate_limit_max_cooldowns", 3)),
+        extra_history_days=int(required["required_history_days"]),
+    )
+
+    strict_cache_validation = bool(cache_cfg.get("strict_cache_validation", False))
+    debug_dump_cache = bool(cache_cfg.get("debug_dump_cache_summary", False))
+    cache_status = check_local_cache(
+        data_path,
+        required,
+        save_format=api_config.save_format,
+        strict_validation=strict_cache_validation,
+        include_financials=api_config.include_financials,
+        include_margin=api_config.include_margin,
+        include_topix_index=api_config.include_topix_index,
+        include_nikkei_index=api_config.include_nikkei_index,
+        additional_index_codes=api_config.additional_index_codes,
+    )
+    if cache_status.get("invalid_tables") and not api_config.force_rebuild_cache:
+        for dataset in cache_status.get("invalid_datasets", []):
+            reason = cache_status.get("invalid_reasons", {}).get(dataset, "")
+            logger.log(f"cache invalid dataset={dataset} reason={reason}")
+        if _cache_invalid_requires_force_rebuild(cache_status):
+            logger.log(f"invalid cache values detected; enabling force_rebuild_cache invalid_tables={cache_status.get('invalid_tables')}")
+            api_config.force_rebuild_cache = True
+        else:
+            logger.log(
+                "cache coverage gap detected; keeping existing cache and "
+                f"incrementally downloading missing data invalid_tables={cache_status.get('invalid_tables')}"
+            )
+    logger.log(
+        f"cache_status hit={cache_status['cache_hit']} "
+        f"missing_tables={cache_status['missing_tables']} "
+        f"missing_price_shards={cache_status['missing_price_shards']}"
+    )
+    logger.log(f"cache_table_ranges={cache_status.get('table_ranges')}")
+    if not cache_status["cache_hit"]:
+        download_missing_data(
+            start=required["backtest_start"],
+            end=required["request_end"],
+            data_dir=data_path,
+            api_config=api_config,
+            logger=logger,
+        )
+        cache_status = check_local_cache(
+            data_path,
+            required,
+            save_format=api_config.save_format,
+            strict_validation=strict_cache_validation,
+            include_financials=api_config.include_financials,
+            include_margin=api_config.include_margin,
+            include_topix_index=api_config.include_topix_index,
+            include_nikkei_index=api_config.include_nikkei_index,
+            additional_index_codes=api_config.additional_index_codes,
+        )
+        logger.log(
+            f"cache_status_after_download hit={cache_status['cache_hit']} "
+            f"missing_tables={cache_status['missing_tables']} "
+            f"missing_price_shards={cache_status['missing_price_shards']}"
+        )
+        logger.log(f"cache_table_ranges_after_download={cache_status.get('table_ranges')}")
+        if cache_status.get("invalid_datasets"):
+            for dataset in cache_status.get("invalid_datasets", []):
+                reason = cache_status.get("invalid_reasons", {}).get(dataset, "")
+                logger.log(f"cache still invalid dataset={dataset} reason={reason}")
+        else:
+            logger.log("cache rebuild validation passed")
+    else:
+        logger.log("cache hit: using local cache without J-Quants network calls")
+
+    manifest_path = update_manifest(data_path, required, cache_status, config)
+    logger.log(f"manifest_updated path={manifest_path}")
+    if debug_dump_cache:
+        debug_dump_cache_summary(
+            data_path,
+            required_tables=("universe", "sector", "market_cap", "prices"),
+            asof_date=required["backtest_start"],
+        )
+    else:
+        logger.log("cache_summary_skipped debug_dump_cache_summary=False")
+
+    provider = load_provider_from_local_cache(data_path)
+    logger.log("provider_loaded_from_local_cache")
+    return provider, data_path, cache_status
+
+
 def run_local_backtest(
     *,
     start: str,
@@ -1315,6 +1525,8 @@ def run_local_backtest(
     runs_dir: str | Path = "backtest_runs",
     frequency: str = "monthly",
     force_rebuild_cache: bool = False,
+    provider_module: str | None = None,
+    provider_args: dict[str, str] | None = None,
 ) -> Path:
     config = _load_config(config_file)
     strategy_cfg = dict(config.get("strategy", {}))
@@ -1328,9 +1540,6 @@ def run_local_backtest(
             logger.log(f"user_requested_range={start} to {end}")
             if strategy_mode != "legacy_composite":
                 raise RuntimeError(f"Unsupported strategy mode in this repository: {strategy_mode}")
-            credentials = load_api_credentials(api_file)
-            logger.log(f"api_credentials_loaded file={api_file} keys={sorted(credentials)} token_redacted=True")
-
             bt_config = build_backtest_config(config)
             history_overrides = dict(config.get("history_overrides", {}))
             history_overrides.setdefault("enabled_factors", bt_config.enabled_factors)
@@ -1344,110 +1553,21 @@ def run_local_backtest(
                 f"bulk_months={required['bulk_months']}"
             )
 
-            cache_cfg = dict(config.get("cache", {}))
-            if force_rebuild_cache:
-                cache_cfg["force_rebuild_cache"] = True
-            data_path = Path(data_dir or cache_cfg.get("data_dir", "data_cache"))
-            save_format = str(cache_cfg.get("save_format", "parquet"))
-            api_config = JQuantsApiConfig(
-                **credentials,
-                api_version=str(cache_cfg.get("api_version", "v2")),
-                base_url=str(cache_cfg.get("base_url", "https://api.jquants.com/v2")),
-                include_margin=bool(cache_cfg.get("include_margin", True)),
-                margin_dataset=str(cache_cfg.get("margin_dataset", "weekly_margin_interest")),
-                margin_optional=bool(cache_cfg.get("margin_optional", True)),
-                allow_missing_market_cap=bool(cache_cfg.get("allow_missing_market_cap", True)),
-                market_cap_fallback=str(cache_cfg.get("market_cap_fallback", "liquidity_proxy")),
-                force_rebuild_cache=bool(cache_cfg.get("force_rebuild_cache", False)),
-                include_financials=bool(cache_cfg.get("include_financials", True)),
-                include_topix_index=bool(cache_cfg.get("include_topix_index", True)),
-                include_nikkei_index=bool(cache_cfg.get("include_nikkei_index", True)),
-                additional_index_codes=tuple(str(code).upper() for code in cache_cfg.get("additional_index_codes", [])),
-                save_format=save_format,
-                request_sleep_sec=float(cache_cfg.get("request_sleep_sec", 1.0)),
-                rate_limit_sleep_sec=float(cache_cfg.get("rate_limit_sleep_sec", 300.0)),
-                rate_limit_max_cooldowns=int(cache_cfg.get("rate_limit_max_cooldowns", 3)),
-                extra_history_days=int(required["required_history_days"]),
-            )
-
-            strict_cache_validation = bool(cache_cfg.get("strict_cache_validation", False))
-            debug_dump_cache = bool(cache_cfg.get("debug_dump_cache_summary", False))
-            cache_status = check_local_cache(
-                data_path,
-                required,
-                save_format=api_config.save_format,
-                strict_validation=strict_cache_validation,
-                include_financials=api_config.include_financials,
-                include_margin=api_config.include_margin,
-                include_topix_index=api_config.include_topix_index,
-                include_nikkei_index=api_config.include_nikkei_index,
-                additional_index_codes=api_config.additional_index_codes,
-            )
-            if cache_status.get("invalid_tables") and not api_config.force_rebuild_cache:
-                for dataset in cache_status.get("invalid_datasets", []):
-                    reason = cache_status.get("invalid_reasons", {}).get(dataset, "")
-                    logger.log(f"cache invalid dataset={dataset} reason={reason}")
-                if _cache_invalid_requires_force_rebuild(cache_status):
-                    logger.log(f"invalid cache values detected; enabling force_rebuild_cache invalid_tables={cache_status.get('invalid_tables')}")
-                    api_config.force_rebuild_cache = True
-                else:
-                    logger.log(
-                        "cache coverage gap detected; keeping existing cache and "
-                        f"incrementally downloading missing data invalid_tables={cache_status.get('invalid_tables')}"
-                    )
-            logger.log(
-                f"cache_status hit={cache_status['cache_hit']} "
-                f"missing_tables={cache_status['missing_tables']} "
-                f"missing_price_shards={cache_status['missing_price_shards']}"
-            )
-            logger.log(f"cache_table_ranges={cache_status.get('table_ranges')}")
-            if not cache_status["cache_hit"]:
-                download_missing_data(
-                    start=required["backtest_start"],
-                    end=required["request_end"],
-                    data_dir=data_path,
-                    api_config=api_config,
+            external = _external_provider_spec(config, provider_module, provider_args)
+            if external is not None:
+                provider = load_external_provider(external["module"], external["args"], required=required, logger=logger)
+                data_path = None
+                cache_status = {"data_source": "external_provider", "provider_module": external["module"]}
+                check_external_provider(provider, required, bt_config, logger)
+            else:
+                provider, data_path, cache_status = _prepare_local_cache_provider(
+                    config=config,
+                    api_file=api_file,
+                    data_dir=data_dir,
+                    force_rebuild_cache=force_rebuild_cache,
+                    required=required,
                     logger=logger,
                 )
-                cache_status = check_local_cache(
-                    data_path,
-                    required,
-                    save_format=api_config.save_format,
-                    strict_validation=strict_cache_validation,
-                    include_financials=api_config.include_financials,
-                    include_margin=api_config.include_margin,
-                    include_topix_index=api_config.include_topix_index,
-                    include_nikkei_index=api_config.include_nikkei_index,
-                    additional_index_codes=api_config.additional_index_codes,
-                )
-                logger.log(
-                    f"cache_status_after_download hit={cache_status['cache_hit']} "
-                    f"missing_tables={cache_status['missing_tables']} "
-                    f"missing_price_shards={cache_status['missing_price_shards']}"
-                )
-                logger.log(f"cache_table_ranges_after_download={cache_status.get('table_ranges')}")
-                if cache_status.get("invalid_datasets"):
-                    for dataset in cache_status.get("invalid_datasets", []):
-                        reason = cache_status.get("invalid_reasons", {}).get(dataset, "")
-                        logger.log(f"cache still invalid dataset={dataset} reason={reason}")
-                else:
-                    logger.log("cache rebuild validation passed")
-            else:
-                logger.log("cache hit: using local cache without J-Quants network calls")
-
-            manifest_path = update_manifest(data_path, required, cache_status, config)
-            logger.log(f"manifest_updated path={manifest_path}")
-            if debug_dump_cache:
-                debug_dump_cache_summary(
-                    data_path,
-                    required_tables=("universe", "sector", "market_cap", "prices"),
-                    asof_date=required["backtest_start"],
-                )
-            else:
-                logger.log("cache_summary_skipped debug_dump_cache_summary=False")
-
-            provider = load_provider_from_local_cache(data_path)
-            logger.log("provider_loaded_from_local_cache")
             rules = build_rules(config)
             initial_capital = float(config.get("initial_capital", 100_000_000.0))
             if frequency == "weekly":
@@ -1462,7 +1582,16 @@ def run_local_backtest(
 
             result = run_backtest(rebalance_dates, provider=provider, rules=rules, config=bt_config, initial_capital=initial_capital)
             config_used = {
-                "cli": {"start": start, "end": end, "api_file": str(api_file), "data_dir": str(data_path), "runs_dir": str(runs_dir), "frequency": frequency},
+                "cli": {
+                    "start": start,
+                    "end": end,
+                    "api_file": str(api_file),
+                    "data_dir": str(data_path) if data_path is not None else None,
+                    "runs_dir": str(runs_dir),
+                    "frequency": frequency,
+                    "provider_module": external["module"] if external is not None else None,
+                    "provider_args": external["args"] if external is not None else None,
+                },
                 "config_file": str(config_file) if config_file else None,
                 "config": config,
             }
@@ -1477,11 +1606,13 @@ def run_local_backtest(
             if isinstance(performance_summary, pd.DataFrame):
                 print(performance_log_summary(performance_summary, run_started_at, run_dir), flush=True)
             logger.log(f"outputs_saved run_dir={run_dir} files={output_paths}")
+            if external is not None and callable(getattr(provider, "close", None)):
+                provider.close()
             return run_dir
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run local JP equity historical backtest with J-Quants local cache.")
+    parser = argparse.ArgumentParser(description="Run local JP equity historical backtest with J-Quants local cache or an external provider.")
     default_root = Path(__file__).resolve().parent
     parser.add_argument("--start", required=True, help="User requested backtest start date, e.g. 2025-04-01")
     parser.add_argument("--end", required=True, help="User requested backtest end date, e.g. 2026-03-31")
@@ -1491,6 +1622,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runs-dir", default=str(default_root / "backtest_runs"), help="Backtest result root directory.")
     parser.add_argument("--frequency", choices=["monthly", "biweekly", "weekly"], default="monthly", help="Rebalance frequency.")
     parser.add_argument("--force-rebuild-cache", action="store_true", help="Delete provider market-data cache files/shards before downloading.")
+    parser.add_argument(
+        "--provider-module",
+        default=None,
+        help="Experimental: use an external provider, FILE.py:CLASS or package.module:CLASS, instead of the J-Quants cache.",
+    )
+    parser.add_argument(
+        "--provider-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Keyword argument for --provider-module; repeat for several.",
+    )
     return parser
 
 
@@ -1505,6 +1648,8 @@ def main(argv: list[str] | None = None) -> int:
         runs_dir=args.runs_dir,
         frequency=args.frequency,
         force_rebuild_cache=bool(args.force_rebuild_cache),
+        provider_module=args.provider_module,
+        provider_args=parse_provider_args(args.provider_arg),
     )
     print(f"BACKTEST_RUN_DIR={run_dir}", flush=True)
     return 0
