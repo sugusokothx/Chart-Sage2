@@ -534,6 +534,7 @@ class JpxHistoricalProvider(HistoricalDataProvider):
                     "Close",
                     "Volume",
                     "adjustment_close",
+                    "adjustment_volume",
                     "adjustment_factor",
                     "adjustment_price_unreliable",
                     "adjustment_price_issue",

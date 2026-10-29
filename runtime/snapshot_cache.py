@@ -10,7 +10,7 @@ import pandas as pd
 from topix_pool_runtime import RunReport, ScreenRunResult, ScreenRules
 
 
-CACHE_VERSION = "stock_pool_snapshot_cache_v4_corporate_action_continuity"
+CACHE_VERSION = "stock_pool_snapshot_cache_v5_split_adjusted_volatility"
 
 
 def _json_safe(value: Any) -> Any:
