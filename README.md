@@ -596,6 +596,9 @@ report.to_frame()        # one row per check
   example, without `adjustment_factor` holdings are not restated for splits).
 - The engine trades and values holdings at raw open/close and restates share
   counts on each `adjustment_factor` date. Adjusted prices feed factors only.
+- Return-based factors (dual_ma, reversal, momentum) read `adjustment_close`
+  when a code has it and fall back to `close`; without adjusted closes, a split
+  inside the window reads as a price move.
 - Factor loaders are required only for the factors passed in `factors`.
 - A provider whose market caps are a proxy should set `market_cap_basis` to
   describe it; the check then warns that absolute JPY thresholds do not apply.
