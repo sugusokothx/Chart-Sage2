@@ -573,6 +573,25 @@ class LiveTopixProvider(MarketDataProvider):
         return out
 
 
+def _anchor_basis_series(work: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Return closes for returns and volumes on the last row's share basis.
+
+    adjustment_* are on the cache end's basis; scaling volume by the last
+    row's adjustment_close / close brings it back to the anchor's basis.
+    Codes with no adjusted values fall back to close and volume.
+    """
+
+    close, volume = work["close"], work["volume"]
+    if "adjustment_close" not in work.columns or "adjustment_volume" not in work.columns:
+        return close, volume
+    codes = work["code"]
+    has_adjusted = work["adjustment_close"].notna().groupby(codes).transform("all") & work["adjustment_volume"].notna().groupby(codes).transform("all")
+    last = work.groupby(codes)
+    to_anchor = (last["adjustment_close"].transform("last") / last["close"].transform("last")).replace([np.inf, -np.inf], np.nan)
+    has_adjusted &= to_anchor.notna()
+    return work["adjustment_close"].where(has_adjusted, close), (work["adjustment_volume"] * to_anchor).where(has_adjusted, volume)
+
+
 def _build_snapshot_vectorized(
     codes: list[str],
     sector_map: dict[str, str],
@@ -619,7 +638,7 @@ def _build_snapshot_vectorized(
 
     # Keep only the minimal columns needed for the screening snapshot.
     keep_cols = ["code", "date"]
-    for col in ["close", "volume"]:
+    for col in ["close", "volume", "adjustment_close", "adjustment_volume"]:
         if col in work.columns:
             work[col] = pd.to_numeric(work[col], errors="coerce")
             keep_cols.append(col)
@@ -658,8 +677,12 @@ def _build_snapshot_vectorized(
     sufficient_history = per_code_rows[per_code_rows >= min_required_rows]
     diagnostics["after_history_length"] = int(sufficient_history.shape[0])
 
-    close_nonnull = work.loc[work["close"].notna(), ["code", "date", "close"]].copy()
-    volume_nonnull = work.loc[work["volume"].notna(), ["code", "date", "volume"]].copy()
+    # Prices and volumes on the anchor date's share basis, so a split inside
+    # the lookback is neither a one-day crash in volatility nor a jump in
+    # volume. Codes without adjusted columns keep the raw series.
+    work["return_close"], work["basis_volume"] = _anchor_basis_series(work)
+    close_nonnull = work.loc[work["close"].notna(), ["code", "date", "close", "return_close"]].copy()
+    volume_nonnull = work.loc[work["volume"].notna(), ["code", "date", "basis_volume"]].copy()
 
     close_counts = close_nonnull.groupby("code").size().rename("close_rows")
     volume_counts = volume_nonnull.groupby("code").size().rename("volume_rows")
@@ -669,7 +692,7 @@ def _build_snapshot_vectorized(
     diagnostics["after_close_volume"] = len(eligible_codes)
 
     close_tail = close_nonnull.groupby("code", group_keys=False).tail(vol_lb + 5).copy()
-    close_tail["return"] = close_tail.groupby("code")["close"].pct_change()
+    close_tail["return"] = close_tail["return_close"] / close_tail.groupby("code")["return_close"].shift() - 1.0
     volatility = (
         close_tail.groupby("code")["return"].std().mul(np.sqrt(252)).rename("annualized_volatility").reset_index()
     )
@@ -678,7 +701,7 @@ def _build_snapshot_vectorized(
 
     latest_close = close_nonnull.groupby("code", group_keys=False).tail(1)[["code", "close"]].rename(columns={"close": "close_latest"})
     avg_daily_volume = (
-        volume_nonnull.groupby("code", group_keys=False).tail(liq_lb).groupby("code")["volume"].mean().rename("avg_daily_volume").reset_index()
+        volume_nonnull.groupby("code", group_keys=False).tail(liq_lb).groupby("code")["basis_volume"].mean().rename("avg_daily_volume").reset_index()
     )
     trading_value_rows = work.loc[work["close"].notna() & work["volume"].notna(), ["code", "date", "close", "volume"]].copy()
     trading_value_rows["trading_value"] = trading_value_rows["close"] * trading_value_rows["volume"]
@@ -923,9 +946,13 @@ def build_snapshot(
             _skip("missing_market_cap")
             continue
 
-        avg_daily_volume = float(volume.tail(liq_lb).mean())
+        return_close, basis_volume = close, volume
+        if "Close" in px.columns and "Volume" in px.columns:
+            basis = px.rename(columns={"Close": "close", "Volume": "volume"}).assign(code=code)
+            return_close, basis_volume = (series.dropna() for series in _anchor_basis_series(basis))
+        avg_daily_volume = float(basis_volume.tail(liq_lb).mean())
         avg_daily_trading_value = float((close * volume).tail(liq_lb).mean())
-        annualized_volatility = annualized_vol_from_close(close.tail(vol_lb + 5))
+        annualized_volatility = annualized_vol_from_close(return_close.tail(vol_lb + 5))
         if pd.isna(annualized_volatility):
             _skip("nan_volatility")
             report.add_issue(
