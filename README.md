@@ -193,6 +193,12 @@ Typical outputs include:
 - regime and allocation diagnostics
 - performance summaries and time series
 
+`nav.csv` has one row per trading day from the first execution to the last,
+marked at the execution price (`close` by default); `turnover` is non-zero only
+on rebalance and stop-loss days. Volatility, Sharpe and Sortino scale each
+return by the square root of the weekdays it spans, so gaps in a series do not
+shrink them.
+
 ## Config examples
 
 - Start with `configs/minimal_long_only.example.json` if you want a smaller,

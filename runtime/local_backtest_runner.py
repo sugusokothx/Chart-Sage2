@@ -918,7 +918,11 @@ def _metric_row(dates: pd.Series, nav: pd.Series, series_name: str, *, benchmark
     total_return = end_nav / start_nav - 1.0 if start_nav > 0 else np.nan
     days = max(1, int((work["date"].iloc[-1] - work["date"].iloc[0]).days))
     annualized_return = (1.0 + total_return) ** (365.25 / days) - 1.0 if pd.notna(total_return) and total_return > -1 else np.nan
-    interval_days = work["date"].diff().dt.days
+    dates = work["date"].to_numpy(dtype="datetime64[D]")
+    interval_days = pd.Series(np.nan, index=work.index)
+    if len(dates) > 1:
+        # A weekend-dated row would count zero weekdays; treat it as one day.
+        interval_days.iloc[1:] = np.maximum(np.busday_count(dates[:-1], dates[1:]), 1)
     log_returns = np.log(work["nav"] / work["nav"].shift(1))
     interval_frame = pd.DataFrame(
         {
@@ -931,10 +935,11 @@ def _metric_row(dates: pd.Series, nav: pd.Series, series_name: str, *, benchmark
         annualized_volatility = np.nan
         downside_deviation = np.nan
     else:
-        # The strategy NAV is recorded on irregular event dates rather than a
-        # dense daily grid. Dailyizing interval log-returns avoids treating a
-        # 30-day move as if it were a 1-day move when annualizing volatility.
-        interval_frame["daily_log_return"] = interval_frame["log_return"] / interval_frame["interval_days"]
+        # Intervals are counted in weekdays, so a weekend is one day.  A move
+        # over n days has n times a day's variance, so it is scaled by sqrt(n)
+        # to a one-day move; dividing by n would shrink volatility.  Exchange
+        # holidays still count as days, which slightly understates it.
+        interval_frame["daily_log_return"] = interval_frame["log_return"] / np.sqrt(interval_frame["interval_days"])
         daily_log_returns = interval_frame["daily_log_return"]
         annualized_volatility = float(daily_log_returns.std(ddof=0) * np.sqrt(252.0))
         downside_daily_log_returns = daily_log_returns.clip(upper=0.0)

@@ -2128,14 +2128,12 @@ def _stop_loss_exit_codes(
     return triggered
 
 
-def _stop_loss_monitor_dates(
+def _trading_dates_between(
     provider: JpxHistoricalProvider,
     start_exclusive: pd.Timestamp | None,
     end_exclusive: pd.Timestamp | None,
-    frequency: str,
 ) -> list[pd.Timestamp]:
-    mode = str(frequency or "monthly").lower()
-    if mode not in {"weekly", "daily"} or start_exclusive is None or end_exclusive is None:
+    if start_exclusive is None or end_exclusive is None:
         return []
     prices = provider.table("prices", copy=False)
     dates = pd.Series(pd.to_datetime(prices["date"].dropna().unique())).sort_values()
@@ -2143,11 +2141,16 @@ def _stop_loss_monitor_dates(
         dates.gt(pd.Timestamp(start_exclusive).normalize())
         & dates.lt(pd.Timestamp(end_exclusive).normalize())
     ]
-    if dates.empty:
+    return [pd.Timestamp(x).normalize() for x in dates.tolist()]
+
+
+def _stop_loss_monitor_dates(trading_dates: list[pd.Timestamp], frequency: str) -> list[pd.Timestamp]:
+    mode = str(frequency or "monthly").lower()
+    if mode not in {"weekly", "daily"} or not trading_dates:
         return []
     if mode == "daily":
-        return [pd.Timestamp(x).normalize() for x in dates.tolist()]
-    frame = pd.DataFrame({"date": dates})
+        return list(trading_dates)
+    frame = pd.DataFrame({"date": pd.to_datetime(trading_dates)})
     frame["week"] = frame["date"].dt.to_period("W-FRI")
     return [pd.Timestamp(x).normalize() for x in frame.groupby("week")["date"].max().tolist()]
 
@@ -2245,20 +2248,22 @@ def _run_interim_stop_loss_checks(
     trade_rows: list[dict[str, Any]],
     corporate_action_rows: list[dict[str, Any]],
 ) -> tuple[float, pd.Timestamp | None, dict[str, int]]:
-    monitor_dates = _stop_loss_monitor_dates(provider, start_exclusive, end_exclusive, cfg.stop_loss_check_frequency)
-    if not monitor_dates:
-        return cash, start_exclusive, {"check_dates": 0, "exit_rows": 0, "order_rows": 0, "trade_rows": 0, "exited_codes": []}
+    # Every trading day between executions gets a NAV row, so performance
+    # metrics see daily moves; stop-losses are checked only on monitor dates.
+    stats = {"check_dates": 0, "exit_rows": 0, "order_rows": 0, "trade_rows": 0, "exited_codes": []}
+    trading_dates = _trading_dates_between(provider, start_exclusive, end_exclusive)
+    if not trading_dates:
+        return cash, start_exclusive, stats
+    monitor_dates = set(_stop_loss_monitor_dates(trading_dates, cfg.stop_loss_check_frequency))
     initial_holdings = sorted(str(code) for code, qty in holdings.items() if int(qty) != 0)
-    if not initial_holdings:
-        return cash, start_exclusive, {"check_dates": 0, "exit_rows": 0, "order_rows": 0, "trade_rows": 0, "exited_codes": []}
-    history_start = pd.Timestamp(monitor_dates[0]).normalize()
-    history_end = pd.Timestamp(monitor_dates[-1]).normalize()
-    price_history = _execution_price_history(provider, initial_holdings, history_start, history_end, cfg.execution_price)
+    history_end = pd.Timestamp(trading_dates[-1]).normalize()
+    # Start at the last execution so a holding without a trade on the first
+    # days is marked at its previous price instead of at zero.
+    price_history = _execution_price_history(provider, initial_holdings, start_exclusive, history_end, cfg.execution_price)
+    mark_prices = price_history.reindex(price_history.index.union(pd.DatetimeIndex(trading_dates))).ffill()
     action_history = _corporate_action_history(provider, initial_holdings, start_exclusive, history_end)
     checkpoint = pd.Timestamp(start_exclusive).normalize() if start_exclusive is not None else None
-    stats = {"check_dates": 0, "exit_rows": 0, "order_rows": 0, "trade_rows": 0, "exited_codes": []}
-    for check_date in monitor_dates:
-        stats["check_dates"] += 1
+    for check_date in trading_dates:
         if holdings and checkpoint is not None:
             if action_history.empty:
                 action_factors = pd.Series(dtype=float)
@@ -2276,33 +2281,32 @@ def _run_interim_stop_loss_checks(
                 )
             _apply_corporate_actions(holdings, cost_basis, action_factors, check_date, corporate_action_rows)
         checkpoint = check_date
-        if not holdings:
-            continue
-        if price_history.empty or check_date not in price_history.index:
-            continue
-        prices = pd.to_numeric(price_history.loc[check_date].reindex(sorted(holdings)), errors="coerce")
-        prices = prices.dropna()
-        if prices.empty:
-            continue
-        nav_before = _portfolio_value(holdings, prices, cash)
-        cash, exit_rows, order_rows, trade_count, traded_value, exited_codes = _execute_stop_loss_exits(
-            signal_date=check_date,
-            execution_date=check_date,
-            holdings=holdings,
-            cost_basis=cost_basis,
-            prices=prices,
-            cfg=cfg,
-            cash=cash,
-            trade_rows=trade_rows,
-        )
-        stats["exit_rows"] += exit_rows
-        stats["order_rows"] += order_rows
-        stats["trade_rows"] += trade_count
-        stats["exited_codes"].extend(sorted(exited_codes))
-        if exit_rows > 0:
-            nav_after = _portfolio_value(holdings, prices, cash)
-            turnover = traded_value / nav_before if nav_before else np.nan
-            nav_rows.append({"date": check_date, "nav": nav_after, "cash": cash, "turnover": turnover})
+        marks = pd.to_numeric(mark_prices.loc[check_date], errors="coerce") if holdings else pd.Series(dtype=float)
+        nav_before = _portfolio_value(holdings, marks, cash)
+        traded_value = 0.0
+        if check_date in monitor_dates:
+            stats["check_dates"] += 1
+            prices = pd.Series(dtype=float)
+            if holdings and check_date in price_history.index:
+                prices = pd.to_numeric(price_history.loc[check_date].reindex(sorted(holdings)), errors="coerce").dropna()
+            if not prices.empty:
+                cash, exit_rows, order_rows, trade_count, traded_value, exited_codes = _execute_stop_loss_exits(
+                    signal_date=check_date,
+                    execution_date=check_date,
+                    holdings=holdings,
+                    cost_basis=cost_basis,
+                    prices=prices,
+                    cfg=cfg,
+                    cash=cash,
+                    trade_rows=trade_rows,
+                )
+                stats["exit_rows"] += exit_rows
+                stats["order_rows"] += order_rows
+                stats["trade_rows"] += trade_count
+                stats["exited_codes"].extend(sorted(exited_codes))
+        nav_after = _portfolio_value(holdings, marks, cash)
+        turnover = traded_value / nav_before if nav_before else np.nan
+        nav_rows.append({"date": check_date, "nav": nav_after, "cash": cash, "turnover": turnover})
     return cash, checkpoint, stats
 
 
@@ -2527,7 +2531,7 @@ def run_backtest(
             target_codes = set()
         monitor_stats = {"check_dates": 0, "exit_rows": 0, "order_rows": 0, "trade_rows": 0}
         checkpoint_date = last_execution_date
-        if holdings and last_execution_date is not None:
+        if last_execution_date is not None:
             cash, checkpoint_date, monitor_stats = _run_interim_stop_loss_checks(
                 provider=provider,
                 holdings=holdings,
